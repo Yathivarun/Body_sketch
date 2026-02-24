@@ -1,52 +1,19 @@
 name: "sketch_pipeline"
-backend : "python"
 platform: "ensemble"
 max_batch_size: 1
 
 input [
-  {
-    name: "image_bytes"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
-  },
-  {
-    name: "person_id"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
-  },
-  {
-    name: "gender"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
-  },
-  {
-    name: "place"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
-  }
+  { name: "image_bytes"  data_type: TYPE_STRING  dims: [ 1 ] },
+  { name: "person_id"    data_type: TYPE_STRING  dims: [ 1 ] },
+  { name: "gender"       data_type: TYPE_STRING  dims: [ 1 ] },
+  { name: "place"        data_type: TYPE_STRING  dims: [ 1 ] }
 ]
 
 output [
-  {
-    name: "scene_images"
-    data_type: TYPE_STRING
-    dims: [ -1 ]
-  },
-  {
-    name: "scene_names"
-    data_type: TYPE_STRING
-    dims: [ -1 ]
-  },
-  {
-    name: "person_id"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
-  },
-  {
-    name: "status"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
-  }
+  { name: "scene_images"  data_type: TYPE_STRING  dims: [ -1 ] },
+  { name: "scene_names"   data_type: TYPE_STRING  dims: [ -1 ] },
+  { name: "person_id"     data_type: TYPE_STRING  dims: [ 1 ] },
+  { name: "status"        data_type: TYPE_STRING  dims: [ 1 ] }
 ]
 
 ensemble_scheduling {
@@ -54,66 +21,24 @@ ensemble_scheduling {
     {
       model_name: "sketch_preprocess"
       model_version: 1
-      input_map {
-        key: "image_bytes"
-        value: "image_bytes"
-      }
-      input_map {
-        key: "person_id"
-        value: "person_id"
-      }
-      input_map {
-        key: "gender"
-        value: "gender"
-      }
-      input_map {
-        key: "place"
-        value: "place"
-      }
-      output_map {
-        key: "preprocessed_data"
-        value: "preprocessed_data"
-      }
-      output_map {
-        key: "person_id"
-        value: "person_id_intermediate"
-      }
-      output_map {
-        key: "status"
-        value: "preprocess_status"
-      }
+      input_map  { key: "image_bytes"  value: "image_bytes" }
+      input_map  { key: "person_id"    value: "person_id" }
+      input_map  { key: "gender"       value: "gender" }
+      input_map  { key: "place"        value: "place" }
+      output_map { key: "preprocessed_data"  value: "preprocessed_data" }
+      output_map { key: "person_id"          value: "person_id_mid" }
+      output_map { key: "status"             value: "preprocess_status" }
     },
     {
       model_name: "sketch_generate"
       model_version: 1
-      input_map {
-        key: "preprocessed_data"
-        value: "preprocessed_data"
-      }
-      input_map {
-        key: "person_id"
-        value: "person_id_intermediate"
-      }
-      input_map {
-        key: "status"
-        value: "preprocess_status"
-      }
-      output_map {
-        key: "scene_images"
-        value: "scene_images"
-      }
-      output_map {
-        key: "scene_names"
-        value: "scene_names"
-      }
-      output_map {
-        key: "person_id"
-        value: "person_id"
-      }
-      output_map {
-        key: "status"
-        value: "status"
-      }
+      input_map  { key: "preprocessed_data"  value: "preprocessed_data" }
+      input_map  { key: "person_id"          value: "person_id_mid" }
+      input_map  { key: "status"             value: "preprocess_status" }
+      output_map { key: "scene_images"  value: "scene_images" }
+      output_map { key: "scene_names"   value: "scene_names" }
+      output_map { key: "person_id"     value: "person_id" }
+      output_map { key: "status"        value: "status" }
     }
   ]
 }
