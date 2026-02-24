@@ -1,13 +1,21 @@
 # =============================================================================
 # Triton Inference Server — Portrait Sketch Pipeline
-# Base: Triton with Python backend support
-# PyTorch is installed explicitly BEFORE requirements.txt to prevent pip
-# from auto-upgrading/downgrading it when resolving other packages.
+# Base: Triton 24.01 / Python 3.10 / CUDA 12.1
+#
+# Install order matters:
+#   1. System libs
+#   2. torch + torchvision (pinned, must come before everything else)
+#   3. requirements.txt (all deps except rembg and tritonclient)
+#   4. rembg --no-deps (prevents it pulling a conflicting onnxruntime)
+#   5. tritonclient
+#   6. Copy source code
 # =============================================================================
 
 FROM nvcr.io/nvidia/tritonserver:24.01-py3
 
-# ── System dependencies ───────────────────────────────────────────────────────
+# ── Step 1: System dependencies ───────────────────────────────────────────────
+# libgl1 + libglib2.0 required by opencv-python-headless at runtime
+# libgomp1 required by insightface / onnxruntime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
@@ -21,54 +29,58 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python backend support for Triton ────────────────────────────────────────
-# Triton 24.01 ships Python 3.10; ensure pip is up to date
 RUN pip install --no-cache-dir --upgrade pip
 
-# ── Step 1: Pin PyTorch FIRST (CUDA 12.1 wheels matching Triton 24.01 base) ──
-# Installing torch separately ensures no other package can silently upgrade it.
+# ── Step 2: PyTorch — pinned BEFORE requirements.txt ─────────────────────────
+# Must come first so nothing in requirements.txt can override the version.
+# cu121 wheels match the CUDA 12.1 runtime in Triton 24.01 base image.
 RUN pip install --no-cache-dir \
     torch==2.2.0+cu121 \
     torchvision==0.17.0+cu121 \
     --extra-index-url https://download.pytorch.org/whl/cu121
 
-# ── Step 2: Install all other project dependencies ────────────────────────────
-# torch is already satisfied above; pip will skip it due to version match.
+# ── Step 3: All project dependencies ─────────────────────────────────────────
+# rembg intentionally excluded here — installed separately in Step 4.
+# torch/torchvision already satisfied above; pip will not touch them.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# ── Step 3: ip_adapter — not on PyPI, copied directly into the project ────────
-# The ip_adapter/ folder is part of the project source and lands at /app/ip_adapter/
-# We add /app to PYTHONPATH so `from ip_adapter.ip_adapter_faceid import ...` resolves.
+# ── Step 4: rembg — installed with --no-deps ──────────────────────────────────
+# rembg's setup.py pulls onnxruntime (CPU) as a hard dependency which would
+# conflict with onnxruntime-gpu already installed above.
+# --no-deps skips that pull entirely. All of rembg's actual runtime needs
+# (numpy, pillow, opencv, onnxruntime-gpu, pooch, PyMatting) are already
+# present from Step 3.
+RUN pip install --no-cache-dir --no-deps rembg==2.0.69
 
-# ── Step 4: triton python backend client library ──────────────────────────────
+# ── Step 5: Triton client library ─────────────────────────────────────────────
 RUN pip install --no-cache-dir tritonclient[all]
 
-# ── Working directory ─────────────────────────────────────────────────────────
+# ── Step 6: Copy project source ───────────────────────────────────────────────
+# Only source code is copied into the image.
+# Model weights, scenes, crops.json are volume-mounted at runtime.
 WORKDIR /app
 
-# ── Copy project source ───────────────────────────────────────────────────────
-# Copies: pipeline/, ip_adapter/, config.py, crops.json
-# Model weights and scenes are volume-mounted — NOT baked into the image.
 COPY pipeline/         /app/pipeline/
 COPY ip_adapter/       /app/ip_adapter/
+COPY model_repository/ /app/model_repository/
 COPY config.py         /app/config.py
 COPY crops.json        /app/crops.json
 
-# Model repository for Triton (backends defined here)
-COPY model_repository/ /app/model_repository/
-
-# ── PYTHONPATH: /app so both `pipeline.*` and `ip_adapter.*` resolve ──────────
+# ── PYTHONPATH ────────────────────────────────────────────────────────────────
+# /app resolves both `pipeline.*` and `ip_adapter.*` imports
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 
-# ── Expose Triton ports ───────────────────────────────────────────────────────
-# 8000 = HTTP, 8001 = gRPC, 8002 = metrics
+# ── Prevent runtime downloads ─────────────────────────────────────────────────
+# All models must be volume-mounted. These flags make missing models
+# fail loudly at startup rather than silently downloading.
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_DATASETS_OFFLINE=1
+
+# ── Triton ports ──────────────────────────────────────────────────────────────
 EXPOSE 8000 8001 8002
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-# --model-repository: where Triton reads model configs
-# --backend-directory: Triton's own backend libs (already in base image)
-# --log-verbose=1: helpful during development, remove in production
 CMD ["tritonserver", \
      "--model-repository=/app/model_repository", \
      "--log-verbose=1"]
