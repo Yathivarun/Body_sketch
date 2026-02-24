@@ -1,14 +1,6 @@
 # ============================================================================
 # requirements.txt — Portrait Sketch Pipeline
 # Triton 24.01 base image / Python 3.10 / CUDA 12.1
-#
-# DO NOT add torch or torchvision here — pinned in Dockerfile Step 1.
-# DO NOT add tritonclient here — installed in Dockerfile Step 5.
-# DO NOT add onnxruntime (CPU) — onnxruntime-gpu covers everything.
-# DO NOT add opencv-python or opencv-contrib-python — headless only in Docker.
-# rembg is installed with --no-deps in Dockerfile Step 4 to avoid its
-# transitive pulls from fighting onnxruntime-gpu. Its actual runtime
-# deps are already satisfied by packages listed here.
 # ============================================================================
 
 # ── Core numerics ─────────────────────────────────────────────────────────────
