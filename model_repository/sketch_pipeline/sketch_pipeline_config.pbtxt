@@ -1,26 +1,27 @@
 name: "sketch_pipeline"
+backend : "python"
 platform: "ensemble"
 max_batch_size: 1
 
 input [
   {
     name: "image_bytes"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ 1 ]
   },
   {
     name: "person_id"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ 1 ]
   },
   {
     name: "gender"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ 1 ]
   },
   {
     name: "place"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ 1 ]
   }
 ]
@@ -28,22 +29,22 @@ input [
 output [
   {
     name: "scene_images"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ -1 ]
   },
   {
     name: "scene_names"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ -1 ]
   },
   {
     name: "person_id"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ 1 ]
   },
   {
     name: "status"
-    data_type: TYPE_BYTES
+    data_type: TYPE_STRING
     dims: [ 1 ]
   }
 ]
