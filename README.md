@@ -164,3 +164,48 @@ The pipeline already uses `person_id` and `place` as first-class inputs, matchin
 4. Upload the returned scene images back to MinIO as `ID_place_sketch_N.jpg`
 
 No changes to Triton backends required.
+
+
+
+# 1. Build the image
+```
+docker build -t body-sketch .
+```
+
+# 2. Run the container
+```
+docker run -d \
+  --name body-sketch \
+  --gpus all \
+  -p 8000:8000 \
+  -p 8001:8001 \
+  -p 8002:8002 \
+  -v $(pwd)/models:/app/models:ro \
+  -v $(pwd)/inputs:/app/inputs:ro \
+  -v $(pwd)/crops.json:/app/crops.json:ro \
+  -v $(pwd)/pipeline:/app/pipeline:ro \
+  --shm-size=4gb \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  body-sketch
+```
+
+# 3. Watch logs (wait until you see "Started GRPCInferenceService")
+```
+docker logs -f body-sketch
+```
+
+# 4. Check server is ready
+```
+curl http://localhost:8000/v2/health/ready
+```
+Once {"live":true} comes back from the health check, run your test:
+bashpython client_test.py --image person.jpg --id A1234 --gender female --place SAU
+If you need to stop or restart:
+bash# stop and remove
+docker stop body-sketch && docker rm body-sketch
+
+# restart without rebuild (after editing pipeline/ files)
+```
+docker restart body-sketch
+```
