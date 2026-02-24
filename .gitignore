@@ -21,6 +21,3 @@ models/
 .vscode/
 .idea/
 .DS_Store
-
-# JSON outputs (optional)
-crops.json
