@@ -1,0 +1,51 @@
+name: "sketch_preprocess"
+backend: "python"
+max_batch_size: 1
+
+input [
+  {
+    name: "image_bytes"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  },
+  {
+    name: "person_id"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  },
+  {
+    name: "gender"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  },
+  {
+    name: "place"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "preprocessed_data"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  },
+  {
+    name: "person_id"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  },
+  {
+    name: "status"
+    data_type: TYPE_BYTES
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_CPU
+    count: 1
+  }
+]

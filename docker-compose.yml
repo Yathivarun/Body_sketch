@@ -1,0 +1,48 @@
+version: "3.8"
+
+services:
+  sketch-triton:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sketch-triton:latest
+    container_name: sketch-triton
+
+    # ── GPU access ────────────────────────────────────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+    # ── Ports ─────────────────────────────────────────────────────────────────
+    ports:
+      - "8000:8000"   # HTTP inference
+      - "8001:8001"   # gRPC inference
+      - "8002:8002"   # Prometheus metrics
+
+    # ── Volume mounts — nothing large is baked into the image ─────────────────
+    volumes:
+      # Model weights — mount your local weights directory here
+      - ./models:/app/models:ro
+
+      # Scene backgrounds and crops config
+      - ./inputs:/app/inputs:ro
+      - ./crops.json:/app/crops.json:ro
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    environment:
+      - PYTHONPATH=/app
+      # Prevent rembg / huggingface from downloading at runtime
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+
+    # ── Shared memory for Triton tensor transfers ─────────────────────────────
+    shm_size: "4gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    restart: unless-stopped

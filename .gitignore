@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+sketchclean/
+venv/
+.env/
+
+# Models & weights (huge files)
+models/
+*.safetensors
+*.bin
+*.onnx
+*.pth
+*.zip
+
+# System / IDE
+.vscode/
+.idea/
+.DS_Store
+
+# JSON outputs (optional)
+crops.json
