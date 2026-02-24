@@ -5,16 +5,16 @@
 
 # ── Core numerics ─────────────────────────────────────────────────────────────
 numpy==1.26.4
-scipy==1.15.3
+scipy==1.11.4
 sympy==1.14.0
 
 # ── Image processing ──────────────────────────────────────────────────────────
 pillow==10.2.0
-opencv-python-headless==4.12.0.88
-scikit-image==0.25.2
-imageio==2.37.2
-tifffile==2025.5.10          # required by scikit-image
-lazy_loader==0.4             # required by scikit-image
+opencv-python-headless==4.9.0.80
+scikit-image==0.22.0
+imageio==2.33.1
+tifffile==2023.7.10
+lazy_loader==0.3
 
 # ── Diffusion / generation ────────────────────────────────────────────────────
 diffusers==0.25.1
