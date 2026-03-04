@@ -1,10 +1,8 @@
 """
 Test client for the sketch_pipeline Triton ensemble.
-Sends one image + metadata and saves the returned scene images to ./test_output/.
-
 Usage:
-    python client_test.py --image path/to/person.jpg --id A1234 --gender female
-    python client_test.py --image path/to/person.jpg --id A1234 --gender male --place SAU
+    python client_test.py --image person.jpg --id A1234 --gender female --place SAU
+    python client_test.py --image person.jpg --id A1234 --gender female --place SAU --url 192.168.1.10:8000
 """
 
 import argparse
@@ -19,49 +17,39 @@ from PIL import Image
 try:
     import tritonclient.http as httpclient
 except ImportError:
-    print("ERROR: Install tritonclient — pip install tritonclient[http]")
+    print("ERROR: pip install tritonclient[http]")
     sys.exit(1)
 
-
-# ── Defaults ──────────────────────────────────────────────────────────────────
-TRITON_URL   = os.getenv("TRITON_URL", "localhost:8000")
-MODEL_NAME   = "sketch_pipeline"
-OUTPUT_DIR   = Path("test_output")
+OUTPUT_DIR = Path("test_output")
 
 
-def load_image_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def run(image_path: str, person_id: str, gender: str, place: str):
+def run(image_path, person_id, gender, place, url):
     OUTPUT_DIR.mkdir(exist_ok=True)
+    client = httpclient.InferenceServerClient(url=url)
 
-    client = httpclient.InferenceServerClient(url=TRITON_URL)
-
-    # ── Check server health ───────────────────────────────────────────────────
     if not client.is_server_live():
-        print(f"ERROR: Triton server not live at {TRITON_URL}")
+        print(f"ERROR: Server not live at {url}")
         sys.exit(1)
-    if not client.is_model_ready(MODEL_NAME):
-        print(f"ERROR: Model '{MODEL_NAME}' not ready")
+    if not client.is_model_ready("sketch_pipeline"):
+        print("ERROR: sketch_pipeline not ready")
         sys.exit(1)
 
-    print(f"Server live. Sending request: id={person_id} gender={gender} place={place}")
+    print(f"Server ready. Sending: id={person_id} gender={gender} place={place}")
 
-    # ── Prepare inputs ────────────────────────────────────────────────────────
-    image_bytes = load_image_bytes(image_path)
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
 
-    def bytes_input(name: str, value: bytes) -> httpclient.InferInput:
-        inp = httpclient.InferInput(name, [1, 1], "BYTES")
-        inp.set_data_from_numpy(np.array([[value]], dtype=object))
+    def make_input(name, value: bytes):
+        # max_batch_size=0 means NO batch dim — shape is exactly [1]
+        inp = httpclient.InferInput(name, [1], "BYTES")
+        inp.set_data_from_numpy(np.array([value], dtype=object))
         return inp
 
     inputs = [
-        bytes_input("image_bytes",  image_bytes),
-        bytes_input("person_id",    person_id.encode()),
-        bytes_input("gender",       gender.encode()),
-        bytes_input("place",        place.encode()),
+        make_input("image_bytes", image_bytes),
+        make_input("person_id",   person_id.encode()),
+        make_input("gender",      gender.encode()),
+        make_input("place",       place.encode()),
     ]
 
     outputs = [
@@ -71,50 +59,48 @@ def run(image_path: str, person_id: str, gender: str, place: str):
         httpclient.InferRequestedOutput("status"),
     ]
 
-    # ── Send request ──────────────────────────────────────────────────────────
     response = client.infer(
-        model_name=MODEL_NAME,
+        model_name="sketch_pipeline",
         inputs=inputs,
         outputs=outputs,
     )
 
-    # ── Parse outputs ─────────────────────────────────────────────────────────
-    status    = response.as_numpy("status")[0].decode("utf-8")
-    ret_id    = response.as_numpy("person_id")[0].decode("utf-8")
-    scenes    = response.as_numpy("scene_images")   # array of bytes
-    names     = response.as_numpy("scene_names")    # array of bytes
+    status   = response.as_numpy("status").flat[0]
+    ret_id   = response.as_numpy("person_id").flat[0]
+    status   = status.decode() if isinstance(status, bytes) else str(status)
+    ret_id   = ret_id.decode() if isinstance(ret_id, bytes) else str(ret_id)
 
-    print(f"\nResponse: id={ret_id} status={status}")
+    print(f"Response: id={ret_id}  status={status}")
 
     if status != "ok":
-        print(f"Pipeline returned non-ok status: {status}")
+        print(f"Pipeline returned: {status}")
         return
 
-    if scenes is None or len(scenes) == 0:
-        print("No scene images returned (check scenes/ directory and crops.json)")
+    scenes = response.as_numpy("scene_images")
+    names  = response.as_numpy("scene_names")
+
+    if scenes is None or len(scenes) == 0 or scenes.flat[0] == b"":
+        print("No scene images returned — check inputs/scenes/ and crops.json")
         return
 
-    # ── Save outputs ──────────────────────────────────────────────────────────
-    for scene_bytes, name_bytes in zip(scenes, names):
-        name = name_bytes.decode("utf-8") if isinstance(name_bytes, bytes) else name_bytes
+    for scene_bytes, name_raw in zip(scenes.flat, names.flat):
+        name = name_raw.decode() if isinstance(name_raw, bytes) else str(name_raw)
         img  = Image.open(io.BytesIO(bytes(scene_bytes)))
         out  = OUTPUT_DIR / f"{ret_id}_{name}.jpg"
         img.save(out, quality=95)
         print(f"  Saved: {out}")
 
-    print(f"\nDone — {len(scenes)} scene(s) saved to {OUTPUT_DIR}/")
+    print(f"\nDone — {len(list(scenes.flat))} scene(s) in {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image",  required=True,  help="Path to input person image")
-    parser.add_argument("--id",     required=True,  help="Person ID string")
+    parser.add_argument("--image",  required=True)
+    parser.add_argument("--id",     required=True)
     parser.add_argument("--gender", default="unknown",
-                        choices=["male", "female", "unknown"], help="Gender from JSON")
+                        choices=["male", "female", "unknown"])
     parser.add_argument("--place",  default="SAU",
-                        choices=["SAU", "FRU"], help="Image source place code")
-    parser.add_argument("--url",    default=TRITON_URL, help="Triton server URL")
+                        choices=["SAU", "FRU"])
+    parser.add_argument("--url",    default="localhost:8000")
     args = parser.parse_args()
-
-    TRITON_URL = args.url
-    run(args.image, args.id, args.gender, args.place)
+    run(args.image, args.id, args.gender, args.place, args.url)
