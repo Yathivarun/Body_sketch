@@ -1,12 +1,35 @@
 """
-Triton Python Backend — sketch_generate (Triton 24.01 / API 1.17)
+Triton Python Backend - sketch_generate (Triton 24.01 compatible)
 """
 
 import io
 import pickle
 import sys
 import traceback
+
 import numpy as np
+from PIL import Image
+
+
+def _decode_string(tensor):
+    """Safely extract a string from a Triton input tensor regardless of shape."""
+    arr = tensor.as_numpy()
+    val = arr.flat[0]
+    if isinstance(val, bytes):
+        return val.decode("utf-8").strip()
+    if isinstance(val, np.ndarray):
+        return val.flat[0].decode("utf-8").strip()
+    return str(val).strip()
+
+def _decode_bytes(tensor):
+    """Safely extract raw bytes from a Triton input tensor."""
+    arr = tensor.as_numpy()
+    val = arr.flat[0]
+    if isinstance(val, (bytes, bytearray)):
+        return bytes(val)
+    if isinstance(val, np.ndarray):
+        return bytes(val.flat[0])
+    return bytes(val)
 
 
 class TritonPythonModel:
@@ -14,11 +37,10 @@ class TritonPythonModel:
     def initialize(self, args):
         import triton_python_backend_utils as pb_utils
         self.pb_utils = pb_utils
-
         sys.path.insert(0, "/app")
         from pipeline.generator import generate_sketch_in_memory
         self._generate = generate_sketch_in_memory
-        print("[sketch_generate] Initialized — pipeline will load on first request")
+        print("[sketch_generate] Initialised")
 
     def execute(self, requests):
         pb_utils = self.pb_utils
@@ -26,27 +48,22 @@ class TritonPythonModel:
 
         for request in requests:
             try:
-                # ── Decode inputs ─────────────────────────────────────────────
-                upstream_status = pb_utils.get_input_tensor_by_name(
-                    request, "status"
-                ).as_numpy()[0].decode("utf-8").strip()
+                upstream_status = _decode_string(
+                    pb_utils.get_input_tensor_by_name(request, "status")
+                )
+                person_id = _decode_string(
+                    pb_utils.get_input_tensor_by_name(request, "person_id")
+                )
 
-                person_id = pb_utils.get_input_tensor_by_name(
-                    request, "person_id"
-                ).as_numpy()[0].decode("utf-8").strip()
-
-                # ── Short-circuit non-ok upstream status ──────────────────────
                 if upstream_status != "ok":
                     print(f"[sketch_generate] Skipping id={person_id}: {upstream_status}")
                     responses.append(self._empty_response(pb_utils, person_id, upstream_status))
                     continue
 
-                # ── Deserialise PreprocessedData ──────────────────────────────
-                raw = pb_utils.get_input_tensor_by_name(
-                    request, "preprocessed_data"
-                ).as_numpy()[0]
-
-                preprocessed = pickle.loads(bytes(raw))
+                raw = _decode_bytes(
+                    pb_utils.get_input_tensor_by_name(request, "preprocessed_data")
+                )
+                preprocessed = pickle.loads(raw)
 
                 if preprocessed is None:
                     responses.append(self._empty_response(
@@ -54,11 +71,9 @@ class TritonPythonModel:
                     ))
                     continue
 
-                print(f"[sketch_generate] Generating id={person_id} gender={preprocessed.gender}")
-
+                print(f"[sketch_generate] id={person_id} gender={preprocessed.gender}")
                 result = self._generate(preprocessed)
 
-                # ── Encode scene images to JPEG bytes ─────────────────────────
                 scene_image_bytes = []
                 scene_names = []
                 for i, scene_img in enumerate(result.scene_images):
@@ -68,14 +83,11 @@ class TritonPythonModel:
                     scene_names.append(f"scene_{i:03d}".encode("utf-8"))
 
                 if not scene_image_bytes:
-                    print(f"[sketch_generate] No scenes produced for id={person_id}")
+                    scene_image_bytes = [b""]
+                    scene_names = [b""]
 
                 responses.append(self._make_response(
-                    pb_utils,
-                    scene_image_bytes=scene_image_bytes,
-                    scene_names=scene_names,
-                    person_id=person_id,
-                    status="ok",
+                    pb_utils, scene_image_bytes, scene_names, person_id, "ok"
                 ))
 
             except Exception as e:
@@ -85,27 +97,19 @@ class TritonPythonModel:
         return responses
 
     def _make_response(self, pb_utils, scene_image_bytes, scene_names, person_id, status):
-        # Use empty arrays when no scenes — dtype=object handles variable-length bytes
-        scenes_arr = np.array(scene_image_bytes if scene_image_bytes else [b""], dtype=object)
-        names_arr  = np.array(scene_names if scene_names else [b""],  dtype=object)
-
-        t_scenes = pb_utils.Tensor("scene_images", scenes_arr)
-        t_names  = pb_utils.Tensor("scene_names",  names_arr)
-        t_id     = pb_utils.Tensor("person_id",
-                       np.array([person_id.encode("utf-8")], dtype=object))
-        t_status = pb_utils.Tensor("status",
-                       np.array([status.encode("utf-8")], dtype=object))
-
-        return pb_utils.InferenceResponse(output_tensors=[t_scenes, t_names, t_id, t_status])
+        return pb_utils.InferenceResponse(output_tensors=[
+            pb_utils.Tensor("scene_images",
+                            np.array(scene_image_bytes, dtype=object)),
+            pb_utils.Tensor("scene_names",
+                            np.array(scene_names, dtype=object)),
+            pb_utils.Tensor("person_id",
+                            np.array([person_id.encode("utf-8")], dtype=object)),
+            pb_utils.Tensor("status",
+                            np.array([status.encode("utf-8")], dtype=object)),
+        ])
 
     def _empty_response(self, pb_utils, person_id, status):
-        return self._make_response(
-            pb_utils,
-            scene_image_bytes=[],
-            scene_names=[],
-            person_id=person_id,
-            status=status,
-        )
+        return self._make_response(pb_utils, [b""], [b""], person_id, status)
 
     def finalize(self):
-        print("[sketch_generate] Finalized")
+        print("[sketch_generate] Finalised")

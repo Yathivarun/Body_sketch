@@ -1,6 +1,6 @@
 name: "sketch_pipeline"
 platform: "ensemble"
-max_batch_size: 1
+max_batch_size: 0
 
 input [
   { name: "image_bytes"  data_type: TYPE_STRING  dims: [ 1 ] },

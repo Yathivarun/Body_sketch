@@ -194,7 +194,7 @@ def _blend_face_sketch(fullbody: Image.Image, face_sketch: Image.Image,
 
 def _verify_local_models():
     missing = [
-        f"  ✗ {n}: {MODEL_PATHS[n]}"
+        f"  [ERROR] {n}: {MODEL_PATHS[n]}"
         for n in ["sd15", "controlnet"]
         if not Path(MODEL_PATHS[n]).exists()
     ]
@@ -209,6 +209,10 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
     Returns (pipe, lora_loaded: bool).
     lora_loaded reflects what was actually baked in — from cache or fresh load.
     """
+
+    print("Loading pipeline fresh...")
+    _MODEL_CACHE["pipeline"] = None
+
     config_key = f"{device}_{dtype}_{load_lora}_{lora_scale}_{use_lcm}"
     if (_MODEL_CACHE["pipeline"] is not None
             and _MODEL_CACHE["pipeline_config"] == config_key):
@@ -247,29 +251,24 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
     # ── LoRA loading ──────────────────────────────────────────────────────────
     lora_loaded = False
     if use_lcm:
-        try:
-            lcm_path = (MODEL_PATHS["lcm_lora"]
-                        if Path(MODEL_PATHS["lcm_lora"]).exists()
-                        else "latent-consistency/lcm-lora-sdv1-5")
-            pipe.load_lora_weights(lcm_path)
-            try:
-                pipe.fuse_lora(lora_scale=1.0)
-            except Exception:
-                pass
+        lcm_path = MODEL_PATHS["lcm_lora"]
+        print("LCM path:", lcm_path)
+        print("Exists:", Path(lcm_path).exists())
 
-            if load_lora and Path(MODEL_PATHS["lora"]).exists():
-                pipe.load_lora_weights(MODEL_PATHS["lora"])
-                try:
-                    pipe.fuse_lora(lora_scale=lora_scale * 1.3)
-                    lora_loaded = True
-                    print(f"[INFO] Style LoRA loaded and fused (scale={lora_scale * 1.3:.2f})")
-                except Exception:
-                    pass
+        pipe.load_lora_weights(lcm_path,weight_name="pytorch_lora_weights.safetensors")
+        print("LCM LoRA loaded")
 
-            pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-            print("[INFO] LCM scheduler activated")
-        except Exception as e:
-            print(f"[WARN] LCM setup failed: {e}")
+        pipe.fuse_lora(lora_scale=1.0)
+        print("LCM LoRA fused")
+
+        if load_lora and Path(MODEL_PATHS["lora"]).exists():
+            pipe.load_lora_weights(MODEL_PATHS["lora"],weight_name="Pencil_Sketch_by_vizsumit.safetensors")
+            pipe.fuse_lora(lora_scale=lora_scale * 1.3)
+            lora_loaded = True
+            print("Style LoRA loaded")
+
+        pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+        print("LCM Scheduler activated")
 
     pipe = pipe.to(device)
 
@@ -369,7 +368,7 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
                     sketch_transparent, scene_file, crops_data[scene_id][0]
                 )
             except Exception as e:
-                print(f"  ✗ Scene {scene_id} failed: {e}")
+                print(f"  [WARN] Scene {scene_id} failed: {e}")
         return None
 
     results: List[Image.Image] = []
@@ -380,7 +379,7 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
             if img is not None:
                 results.append(img)
 
-    print(f"  ✓ {len(results)} scene(s) composed")
+    print(f"  [INFO] {len(results)} scene(s) composed")
     return results
 
 

@@ -468,13 +468,13 @@ def preprocess_image_in_memory(
     override = gender_override.strip().lower() if gender_override else None
     if override in ("male", "female"):
         gender = override
-        print(f"  ✓ Gender from JSON override: {gender}")
+        print(f"  [INFO] Gender from JSON override: {gender}")
     elif primary_face:
         gender = _detect_gender(cropped_rgba, primary_face["box"])
-        print(f"  ✓ Gender from detection: {gender}")
+        print(f"  [INFO] Gender from detection: {gender}")
     else:
         gender = "unknown"
-        print("  ! Gender unknown — no face detected and no JSON override provided")
+        print("  [WARN] Gender unknown — no face detected and no JSON override provided")
 
     # 5. Face enhancement — uniform sharpening, no gender/beard variants
     enhanced = img_corrected.copy()
@@ -486,7 +486,7 @@ def preprocess_image_in_memory(
     if primary_face and INSIGHTFACE_AVAILABLE:
         faceid_embedding = _extract_face_embedding(cropped_rgba, primary_face["box"])
         if faceid_embedding is not None:
-            print(f"  ✓ Face embedding extracted: shape {faceid_embedding.shape}")
+            print(f"  [INFO] Face embedding extracted: shape {faceid_embedding.shape}")
 
     # 7. Parallel edge map generation (body + face)
     def process_body_edges():
