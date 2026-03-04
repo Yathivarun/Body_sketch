@@ -3,9 +3,9 @@ Local test runner — no Triton needed.
 Runs preprocessor -> generator directly and saves all outputs to ./local_test_output/
 
 Usage:
-    python run_local_test.py --image person.jpg --id A1234 --gender female
-    python run_local_test.py --image person.jpg --id A1234 --gender male
-    python run_local_test.py --image person.jpg --id A1234  # no gender, uses detection
+    python local_test.py --image person.jpg --id A1234 --gender female
+    python local_test.py --image person.jpg --id A1234 --gender male
+    python local_test.py --image person.jpg --id A1234  # no gender, uses detection
 """
 
 import argparse
