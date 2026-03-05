@@ -175,19 +175,20 @@ docker build -t body-sketch .
 # 2. Run the container
 ```
 docker run -d \
-  --name body-sketch \
-  --gpus all \
-  -p 8000:8000 \
-  -p 8001:8001 \
-  -p 8002:8002 \
-  -v $(pwd)/models:/app/models:ro \
-  -v $(pwd)/inputs:/app/inputs:ro \
-  -v $(pwd)/crops.json:/app/crops.json:ro \
-  -v $(pwd)/pipeline:/app/pipeline:ro \
-  --shm-size=4gb \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  body-sketch
+--name body-sketch \
+--gpus all \
+-p 10000:8000 \
+-p 8001:8001 \
+-p 8002:8002 \
+-v $(pwd)/models:/app/models:ro \
+-v $(pwd)/pipeline:/app/pipeline:ro \
+-v $(pwd)/inputs:/app/inputs:ro \
+-v $(pwd)/crops.json:/app/crops.json:ro \
+-v $(pwd)/rembg-cache:/root/.u2net \
+--shm-size=4gb \
+--ulimit memlock=-1 \
+--ulimit stack=67108864 \
+body-sketch
 ```
 
 # 3. Watch logs (wait until you see "Started GRPCInferenceService")
