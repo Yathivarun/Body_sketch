@@ -1,5 +1,7 @@
 """
 Triton Python Backend - sketch_generate (Triton 24.01 compatible)
+Dispatches to SAU (full-body) or FRU (face) generator based on the
+type of preprocessed_data received from sketch_preprocess.
 """
 
 import io
@@ -21,6 +23,7 @@ def _decode_string(tensor):
         return val.flat[0].decode("utf-8").strip()
     return str(val).strip()
 
+
 def _decode_bytes(tensor):
     """Safely extract raw bytes from a Triton input tensor."""
     arr = tensor.as_numpy()
@@ -38,9 +41,20 @@ class TritonPythonModel:
         import triton_python_backend_utils as pb_utils
         self.pb_utils = pb_utils
         sys.path.insert(0, "/app")
+
         from pipeline.generator import generate_sketch_in_memory
-        self._generate = generate_sketch_in_memory
-        print("[sketch_generate] Initialised")
+        self._generate_sau = generate_sketch_in_memory
+
+        from pipeline.fru_generator import generate_fru_sketch_in_memory
+        self._generate_fru = generate_fru_sketch_in_memory
+
+        # Import both data classes for isinstance dispatch
+        from pipeline.preprocessor import PreprocessedData
+        from pipeline.fru_preprocessor import FRUPreprocessedData
+        self._PreprocessedData    = PreprocessedData
+        self._FRUPreprocessedData = FRUPreprocessedData
+
+        print("[sketch_generate] Initialised (SAU + FRU)")
 
     def execute(self, requests):
         pb_utils = self.pb_utils
@@ -56,8 +70,12 @@ class TritonPythonModel:
                 )
 
                 if upstream_status != "ok":
-                    print(f"[sketch_generate] Skipping id={person_id}: {upstream_status}")
-                    responses.append(self._empty_response(pb_utils, person_id, upstream_status))
+                    print(
+                        f"[sketch_generate] Skipping id={person_id}: {upstream_status}"
+                    )
+                    responses.append(
+                        self._empty_response(pb_utils, person_id, upstream_status)
+                    )
                     continue
 
                 raw = _decode_bytes(
@@ -71,9 +89,21 @@ class TritonPythonModel:
                     ))
                     continue
 
-                print(f"[sketch_generate] id={person_id} gender={preprocessed.gender}")
-                result = self._generate(preprocessed)
+                # Dispatch based on data type
+                if isinstance(preprocessed, self._FRUPreprocessedData):
+                    print(
+                        f"[sketch_generate] FRU id={person_id} "
+                        f"gender={preprocessed.gender}"
+                    )
+                    result = self._generate_fru(preprocessed)
+                else:
+                    print(
+                        f"[sketch_generate] SAU id={person_id} "
+                        f"gender={preprocessed.gender}"
+                    )
+                    result = self._generate_sau(preprocessed)
 
+                # Pack scene images — same output schema for both SAU and FRU
                 scene_image_bytes = []
                 scene_names = []
                 for i, scene_img in enumerate(result.scene_images):

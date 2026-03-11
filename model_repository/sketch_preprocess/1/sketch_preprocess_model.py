@@ -1,5 +1,6 @@
 """
 Triton Python Backend - sketch_preprocess (Triton 24.01 compatible)
+Routes to SAU (full-body) or FRU (face) preprocessing based on the 'place' input.
 """
 
 import io
@@ -21,6 +22,7 @@ def _decode_string(tensor, name):
         return val.flat[0].decode("utf-8").strip()
     return str(val).strip()
 
+
 def _decode_bytes(tensor):
     """Safely extract raw bytes from a Triton input tensor."""
     arr = tensor.as_numpy()
@@ -38,9 +40,14 @@ class TritonPythonModel:
         import triton_python_backend_utils as pb_utils
         self.pb_utils = pb_utils
         sys.path.insert(0, "/app")
+
         from pipeline.preprocessor import preprocess_image_in_memory
-        self._preprocess = preprocess_image_in_memory
-        print("[sketch_preprocess] Initialised")
+        self._preprocess_sau = preprocess_image_in_memory
+
+        from pipeline.fru_preprocessor import preprocess_fru_image_in_memory
+        self._preprocess_fru = preprocess_fru_image_in_memory
+
+        print("[sketch_preprocess] Initialised (SAU + FRU)")
 
     def execute(self, requests):
         pb_utils = self.pb_utils
@@ -61,23 +68,25 @@ class TritonPythonModel:
                     pb_utils.get_input_tensor_by_name(request, "place"), "place"
                 ).upper()
 
-                # FRU stub
-                if place == "FRU":
-                    responses.append(self._stub_response(
-                        pb_utils, person_id, "FRU_NOT_IMPLEMENTED"
-                    ))
-                    continue
-
                 img = Image.open(io.BytesIO(image_bytes))
                 gender_override = gender_raw if gender_raw in ("male", "female") else None
 
-                print(f"[sketch_preprocess] id={person_id} place={place} "
-                      f"gender_override={gender_override}")
-
-                preprocessed = self._preprocess(
-                    img=img,
-                    gender_override=gender_override,
+                print(
+                    f"[sketch_preprocess] id={person_id} place={place} "
+                    f"gender_override={gender_override}"
                 )
+
+                if place == "FRU":
+                    preprocessed = self._preprocess_fru(
+                        img=img,
+                        gender_override=gender_override,
+                    )
+                else:
+                    # SAU (default) — also handles any unknown place value
+                    preprocessed = self._preprocess_sau(
+                        img=img,
+                        gender_override=gender_override,
+                    )
 
                 responses.append(self._make_response(
                     pb_utils, pickle.dumps(preprocessed), person_id, "ok"
@@ -85,7 +94,7 @@ class TritonPythonModel:
 
             except Exception as e:
                 traceback.print_exc()
-                responses.append(self._stub_response(pb_utils, "", f"error: {e}"))
+                responses.append(self._error_response(pb_utils, "", f"error: {e}"))
 
         return responses
 
@@ -99,7 +108,7 @@ class TritonPythonModel:
                             np.array([status.encode("utf-8")], dtype=object)),
         ])
 
-    def _stub_response(self, pb_utils, person_id, status):
+    def _error_response(self, pb_utils, person_id, status):
         return self._make_response(pb_utils, pickle.dumps(None), person_id, status)
 
     def finalize(self):

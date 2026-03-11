@@ -18,8 +18,12 @@ _PROJECT_ROOT = Path(__file__).parent
 MODELS_ROOT = _PROJECT_ROOT / "models"
 
 # Scene backgrounds and crop configuration — volume-mounted at /app/inputs/
-SCENES_DIR       = _PROJECT_ROOT / "inputs" / "scenes"
+SCENES_DIR        = _PROJECT_ROOT / "inputs" / "scenes"
 CROPS_CONFIG_PATH = _PROJECT_ROOT / "crops.json"
+
+# FRU-specific scene backgrounds and crop configuration
+FRU_SCENES_DIR        = _PROJECT_ROOT / "inputs" / "scenes" / "face_bg"
+FRU_CROPS_CONFIG_PATH = _PROJECT_ROOT / "crops-face-meta.json"
 
 
 # ============================================================================
@@ -33,7 +37,7 @@ MODEL_PATHS = {
 
     # LoRA weights
     "lora":       str(MODELS_ROOT / "loras" / "Pencil_Sketch_by_vizsumit.safetensors"),
-    "lcm_lora":   str(MODELS_ROOT / "loras" / "lcm-lora-sdv1-5"),   # local fallback
+    "lcm_lora":   str(MODELS_ROOT / "loras" / "lcm-lora-sdv1-5"),
 
     # Tiny VAE for faster LCM decoding
     "taesd":      str(MODELS_ROOT / "taesd"),
@@ -48,6 +52,9 @@ MODEL_PATHS = {
     # ControlNet auxiliary annotators
     "annotators_lineart": str(MODELS_ROOT / "annotators" / "lineart"),
     "annotators_hed":     str(MODELS_ROOT / "annotators" / "hed"),
+
+    # BiSeNet face parsing — used by FRU pipeline only
+    "bisenet": str(MODELS_ROOT / "bisenet" / "bisenet_face_parsing.pth"),
 }
 
 
@@ -57,8 +64,8 @@ MODEL_PATHS = {
 
 PREPROCESS_DEFAULTS = {
     "gamma":            1.3,
-    "preserve_details": True,   # fine lineart vs coarse
-    "enhance_faces":    True,   # face region sharpening
+    "preserve_details": True,
+    "enhance_faces":    True,
 }
 
 
@@ -70,7 +77,7 @@ GENERATION_DEFAULTS = {
     "use_lora":        True,
     "lora_scale":      1.0,
     "faceid_strength": 0.85,
-    "use_lcm":         True,    # LCM-LoRA fast inference (4 steps)
+    "use_lcm":         True,
 }
 
 
@@ -80,6 +87,6 @@ GENERATION_DEFAULTS = {
 
 POSTPROCESS_PARAMS = {
     "sharpness": 3.5,
-    "saturation": 0.0,   # 0 = full grayscale
+    "saturation": 0.0,
     "exposure":   0.9,
 }
