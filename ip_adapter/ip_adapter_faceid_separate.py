@@ -347,8 +347,10 @@ class IPAdapterFaceIDPlus:
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     def set_scale(self, scale):
+        # FIX #3: was referencing undefined LoRAIPAttnProcessor — corrected to IPAttnProcessor
+        # which is what set_ip_adapter() installs in this class
         for attn_processor in self.pipe.unet.attn_processors.values():
-            if isinstance(attn_processor, LoRAIPAttnProcessor):
+            if isinstance(attn_processor, IPAttnProcessor):
                 attn_processor.scale = scale
 
     def generate(
@@ -368,7 +370,6 @@ class IPAdapterFaceIDPlus:
     ):
         self.set_scale(scale)
 
-       
         num_prompts = faceid_embeds.size(0)
 
         if prompt is None:

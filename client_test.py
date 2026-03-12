@@ -1,14 +1,26 @@
 """
 Test client for the sketch_pipeline Triton ensemble.
+Supports both SAU (full-body sketch) and FRU (face sketch) pipelines.
+
 Usage:
+    # SAU — full-body sketch
     python client_test.py --image person.jpg --id A1234 --gender female --place SAU
+
+    # FRU — face sketch
+    python client_test.py --image person.jpg --id A1234 --gender female --place FRU
+
+    # Remote server
     python client_test.py --image person.jpg --id A1234 --gender female --place SAU --url 192.168.1.10:8000
+
+    # Unknown gender (auto-detect)
+    python client_test.py --image person.jpg --id A1234 --place SAU
 """
 
 import argparse
 import io
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,63 +29,113 @@ from PIL import Image
 try:
     import tritonclient.http as httpclient
 except ImportError:
-    print("ERROR: pip install tritonclient[http]")
+    print("ERROR: tritonclient not installed.")
+    print("       pip install tritonclient[http]")
     sys.exit(1)
 
 OUTPUT_DIR = Path("test_output")
 
 
-import time
+# ============================================================================
+# HELPERS
+# ============================================================================
 
-def run(image_path, person_id, gender, place, url):
+def make_bytes_input(name: str, value: bytes) -> httpclient.InferInput:
+    inp = httpclient.InferInput(name, [1], "BYTES")
+    inp.set_data_from_numpy(np.array([value], dtype=object))
+    return inp
+
+
+def decode_scalar(arr) -> str:
+    val = arr.flat[0]
+    if isinstance(val, bytes):
+        return val.decode("utf-8")
+    return str(val)
+
+
+def check_server(client, url: str):
+    print(f"[INFO] Connecting to Triton at {url} ...")
+    try:
+        if not client.is_server_live():
+            print(f"[ERROR] Server is not live at {url}")
+            print("        Check that the container is running: docker compose ps")
+            sys.exit(1)
+        print("[INFO] Server is live")
+    except Exception as e:
+        print(f"[ERROR] Cannot reach server at {url}")
+        print(f"        {e}")
+        print("        Is the container running? Is the port correct?")
+        sys.exit(1)
+
+    try:
+        if not client.is_server_ready():
+            print("[ERROR] Server is not ready — models may still be loading")
+            print("        Wait ~60s and retry, or check logs: docker compose logs -f sketch-triton")
+            sys.exit(1)
+        print("[INFO] Server is ready")
+    except Exception as e:
+        print(f"[ERROR] Server ready check failed: {e}")
+        sys.exit(1)
+
+
+def check_model(client, model_name: str):
+    try:
+        if not client.is_model_ready(model_name):
+            print(f"[ERROR] Model '{model_name}' is not ready")
+            print(f"        Check model status: curl http://<host>:8000/v2/models/{model_name}/ready")
+            print(f"        Check logs: docker compose logs -f sketch-triton")
+            sys.exit(1)
+        print(f"[INFO] Model '{model_name}' is ready")
+    except Exception as e:
+        print(f"[ERROR] Model ready check failed: {e}")
+        sys.exit(1)
+
+
+# ============================================================================
+# MAIN RUN
+# ============================================================================
+
+def run(image_path: str, person_id: str, gender: str, place: str, url: str):
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    print("\n[DEBUG] Creating Triton client...")
+    # ── Client setup ──────────────────────────────────────────────────────────
     client = httpclient.InferenceServerClient(
         url=url,
-        connection_timeout=300,
-        network_timeout=300
+        connection_timeout=600,
+        network_timeout=600,
     )
 
-    print("[DEBUG] Checking if server is live...")
-    if not client.is_server_live():
-        print(f"[ERROR] Server not live at {url}")
+    check_server(client, url)
+    check_model(client, "sketch_pipeline")
+
+    # ── Print request summary ─────────────────────────────────────────────────
+    print("")
+    print("=" * 60)
+    print(f"  Pipeline : {place}")
+    print(f"  Image    : {image_path}")
+    print(f"  ID       : {person_id}")
+    print(f"  Gender   : {gender if gender else 'not provided (auto-detect)'}")
+    print(f"  Server   : {url}")
+    print("=" * 60)
+    print("")
+
+    # ── Read image ────────────────────────────────────────────────────────────
+    if not Path(image_path).exists():
+        print(f"[ERROR] Image file not found: {image_path}")
         sys.exit(1)
-    print("[DEBUG] Server is live")
 
-    print("[DEBUG] Checking if model is ready...")
-    if not client.is_model_ready("sketch_pipeline"):
-        print("[ERROR] sketch_pipeline model not ready")
-        sys.exit(1)
-    print("[DEBUG] Model sketch_pipeline is ready")
-
-    print(f"\n[INFO] Sending request")
-    print(f"       id={person_id}")
-    print(f"       gender={gender}")
-    print(f"       place={place}")
-    print(f"       image={image_path}")
-
-    print("[DEBUG] Reading image file...")
     with open(image_path, "rb") as f:
         image_bytes = f.read()
+    print(f"[INFO] Image loaded: {len(image_bytes) / 1024:.1f} KB")
 
-    print(f"[DEBUG] Image size: {len(image_bytes)/1024:.2f} KB")
-
-    def make_input(name, value: bytes):
-        print(f"[DEBUG] Preparing input: {name}")
-        inp = httpclient.InferInput(name, [1], "BYTES")
-        inp.set_data_from_numpy(np.array([value], dtype=object))
-        return inp
-
-    print("[DEBUG] Building inputs...")
+    # ── Build inputs ──────────────────────────────────────────────────────────
     inputs = [
-        make_input("image_bytes", image_bytes),
-        make_input("person_id", person_id.encode()),
-        make_input("gender", gender.encode()),
-        make_input("place", place.encode()),
+        make_bytes_input("image_bytes", image_bytes),
+        make_bytes_input("person_id",   person_id.encode("utf-8")),
+        make_bytes_input("gender",      (gender or "unknown").encode("utf-8")),
+        make_bytes_input("place",       place.encode("utf-8")),
     ]
 
-    print("[DEBUG] Building requested outputs...")
     outputs = [
         httpclient.InferRequestedOutput("scene_images"),
         httpclient.InferRequestedOutput("scene_names"),
@@ -81,8 +143,9 @@ def run(image_path, person_id, gender, place, url):
         httpclient.InferRequestedOutput("status"),
     ]
 
-    print("\n[DEBUG] Sending inference request to Triton...")
-    start_time = time.time()
+    # ── Send request ──────────────────────────────────────────────────────────
+    print("[INFO] Sending inference request ...")
+    start = time.time()
 
     try:
         response = client.infer(
@@ -91,60 +154,108 @@ def run(image_path, person_id, gender, place, url):
             outputs=outputs,
         )
     except Exception as e:
-        print("[ERROR] Exception during infer()")
-        print(e)
+        print(f"[ERROR] Inference request failed: {e}")
+        print("")
+        print("Debugging steps:")
+        print("  1. Check server logs: docker compose logs -f sketch-triton")
+        print("  2. Check model status: curl http://<host>:8000/v2/models/sketch_pipeline/ready")
+        print("  3. Check GPU memory: nvidia-smi")
         sys.exit(1)
 
-    end_time = time.time()
-    print(f"[DEBUG] Response received in {end_time - start_time:.2f} sec")
+    elapsed = time.time() - start
+    print(f"[INFO] Response received in {elapsed:.1f}s")
 
-    print("[DEBUG] Parsing response...")
+    # ── Parse response ────────────────────────────────────────────────────────
+    status  = decode_scalar(response.as_numpy("status"))
+    ret_id  = decode_scalar(response.as_numpy("person_id"))
+    scenes  = response.as_numpy("scene_images")
+    names   = response.as_numpy("scene_names")
 
-    status = response.as_numpy("status").flat[0]
-    ret_id = response.as_numpy("person_id").flat[0]
-
-    status = status.decode() if isinstance(status, bytes) else str(status)
-    ret_id = ret_id.decode() if isinstance(ret_id, bytes) else str(ret_id)
-
-    print(f"[INFO] Response: id={ret_id} status={status}")
+    print(f"[INFO] Response: id={ret_id}  status={status}")
 
     if status != "ok":
-        print(f"[WARNING] Pipeline returned status: {status}")
+        print(f"[ERROR] Pipeline returned error status: {status}")
+        print("")
+        print("Debugging steps:")
+        print("  1. Check server logs: docker compose logs -f sketch-triton")
+        print("  2. Verify input image contains a clearly visible person")
+        print("  3. For FRU: verify input image contains a clearly visible face")
+        sys.exit(1)
+
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    if scenes is None or scenes.flat[0] == b"":
+        print("[WARNING] Pipeline returned no scene images")
+        print("")
+        print("Possible reasons:")
+        print("  SAU: check that inputs/scenes/ contains scene images and crops.json is correct")
+        print("  FRU: check that inputs/scenes/face_bg/ contains scene images and crops-face-meta.json is correct")
+        print("  FRU: check that gender in crops-face-meta.json matches the requested gender")
         return
 
-    print("[DEBUG] Extracting scene outputs...")
-
-    scenes = response.as_numpy("scene_images")
-    names = response.as_numpy("scene_names")
-
-    if scenes is None or len(scenes) == 0 or scenes.flat[0] == b"":
-        print("[WARNING] No scene images returned")
-        return
-
-    print(f"[DEBUG] Number of scenes returned: {len(list(scenes.flat))}")
-
+    saved = 0
     for scene_bytes, name_raw in zip(scenes.flat, names.flat):
-        name = name_raw.decode() if isinstance(name_raw, bytes) else str(name_raw)
+        name = name_raw.decode("utf-8") if isinstance(name_raw, bytes) else str(name_raw)
 
-        print(f"[DEBUG] Processing scene: {name}")
+        if not scene_bytes or scene_bytes == b"":
+            continue
 
-        img = Image.open(io.BytesIO(bytes(scene_bytes)))
-        out = OUTPUT_DIR / f"{ret_id}_{name}.jpg"
+        try:
+            img = Image.open(io.BytesIO(bytes(scene_bytes)))
+            out_path = OUTPUT_DIR / f"{ret_id}_{place.lower()}_{name}.jpg"
+            img.save(out_path, quality=95)
+            print(f"[INFO] Saved: {out_path}  ({img.width}x{img.height})")
+            saved += 1
+        except Exception as e:
+            print(f"[WARNING] Could not save scene '{name}': {e}")
 
-        img.save(out, quality=95)
-        print(f"[INFO] Saved: {out}")
+    print("")
+    print("=" * 60)
+    print(f"  Done. {saved} scene(s) saved to {OUTPUT_DIR}/")
+    print("=" * 60)
+    print("")
 
-    print(f"\n[INFO] Done — {len(list(scenes.flat))} scenes saved to {OUTPUT_DIR}/")
 
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image",  required=True)
-    parser.add_argument("--id",     required=True)
-    parser.add_argument("--gender", default="unknown",
-                        choices=["male", "female", "unknown"])
-    parser.add_argument("--place",  default="SAU",
-                        choices=["SAU", "FRU"])
-    parser.add_argument("--url",    default="localhost:8000")
+    parser = argparse.ArgumentParser(
+        description="Triton test client for SAU (full-body) and FRU (face) sketch pipelines."
+    )
+    parser.add_argument(
+        "--image",
+        required=True,
+        help="Path to input person image (JPG or PNG)",
+    )
+    parser.add_argument(
+        "--id",
+        required=True,
+        help="Person ID string (used in output filenames)",
+    )
+    parser.add_argument(
+        "--gender",
+        default="",
+        choices=["male", "female", ""],
+        help="Gender override. Leave blank to use auto-detection from InsightFace.",
+    )
+    parser.add_argument(
+        "--place",
+        default="SAU",
+        choices=["SAU", "FRU"],
+        help="Pipeline to run: SAU = full-body sketch, FRU = face sketch (default: SAU)",
+    )
+    parser.add_argument(
+        "--url",
+        default="localhost:8000",
+        help="Triton server HTTP endpoint (default: localhost:8000)",
+    )
     args = parser.parse_args()
-    run(args.image, args.id, args.gender, args.place, args.url)
+
+    run(
+        image_path=args.image,
+        person_id=args.id,
+        gender=args.gender,
+        place=args.place,
+        url=args.url,
+    )

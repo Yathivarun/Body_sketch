@@ -13,7 +13,6 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 # ── TF32 optimisation ─────────────────────────────────────────────────────────
@@ -69,7 +68,6 @@ _BISENET_FACE_ONLY      = [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13]
 
 # ============================================================================
 # BISENET MODEL DEFINITION
-# Architecture: zllrunning/face-parsing.PyTorch
 # ============================================================================
 
 def _conv3x3(in_planes, out_planes, stride=1):
@@ -298,7 +296,7 @@ def _init_bisenet() -> Optional[_BiSeNet]:
 
 
 # ============================================================================
-# IMAGE CORRECTION UTILITIES  (shared with SAU preprocessor)
+# IMAGE CORRECTION UTILITIES
 # ============================================================================
 
 def _crop_to_content(img: Image.Image, padding_pct: float = 0.05) -> Tuple[Image.Image, Dict]:
@@ -416,7 +414,6 @@ def _detect_gender(img: Image.Image, face_box: Optional[Tuple] = None) -> str:
         else:
             app = _MODEL_CACHE["insightface_app"]
 
-        # Tight crop around face box with padding to help scrfd on CPU
         if face_box:
             x1, y1, x2, y2 = face_box
             w, h = x2 - x1, y2 - y1
@@ -570,16 +567,11 @@ def _make_edges_enhanced(img: Image.Image, preserve_details: bool = True) -> Ima
 
 
 # ============================================================================
-# FALLBACK OVAL CROP  (used when BiSeNet unavailable)
+# FALLBACK OVAL CROP
 # ============================================================================
 
 def _crop_face_oval(img: Image.Image,
                     face_box: Tuple[int, int, int, int]) -> Tuple[Image.Image, Tuple]:
-    """
-    Oval head crop with no neck or shoulders.
-    25% sides, 40% top (forehead/hair), 10% bottom (chin only).
-    Returns RGBA with elliptical alpha mask.
-    """
     x1, y1, x2, y2 = face_box
     w, h = x2 - x1, y2 - y1
     pad_x   = int(w * 0.25)
@@ -604,15 +596,6 @@ def _crop_face_oval(img: Image.Image,
 # ============================================================================
 
 def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
-    """
-    Background removal, content crop, and white-BG composite.
-    Accepts PIL Image directly (no file I/O).
-
-    Returns:
-        cropped_rgba  — subject on transparent background
-        img_white_bg  — subject on white background
-        crop_info     — crop metadata dict
-    """
     if not REMBG_AVAILABLE:
         raise ImportError("rembg not installed")
     _init_rembg()
@@ -632,7 +615,6 @@ def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
 class FRUPreprocessedData:
     """
     In-memory container holding all FRU artifacts needed by fru_generator.
-    Equivalent to SAU's PreprocessedData but carries face-specific fields.
     """
 
     def __init__(
@@ -678,17 +660,6 @@ def preprocess_fru_image_in_memory(
     """
     Full FRU preprocessing pipeline operating entirely in RAM.
     No files written to disk.
-
-    Args:
-        img:             Input PIL Image (any mode).
-        gender_override: 'male' or 'female' from the Triton gender input.
-                         Skips InsightFace detection when provided.
-        gamma:           Gamma correction value.
-        preserve_details: Use fine lineart (True) or coarse (False).
-        enhance_faces:   Apply face region sharpening.
-
-    Returns:
-        FRUPreprocessedData
     """
     # 1. Background removal + auto-crop
     cropped_rgba, img_white_bg, crop_info = segment_and_crop(img)
@@ -718,7 +689,7 @@ def preprocess_fru_image_in_memory(
     if primary_face and enhance_faces:
         enhanced = _enhance_face_region(enhanced, primary_face)
 
-    # 6. Face embedding (run on RGBA for best identity fidelity)
+    # 6. Face embedding
     faceid_embedding = None
     if primary_face and INSIGHTFACE_AVAILABLE:
         faceid_embedding = _extract_face_embedding(cropped_rgba, primary_face["box"])
@@ -754,7 +725,6 @@ def preprocess_fru_image_in_memory(
             )
             parsing = bs_out_full.squeeze(0).argmax(0).cpu().numpy()
 
-            # Mask 1: face + hair (for crop extent and alpha cutout)
             FACE_HAIR_LABELS = _BISENET_FACE_WITH_HAIR
             mask = np.zeros(parsing.shape, dtype=np.uint8)
             for lid in FACE_HAIR_LABELS:
@@ -762,7 +732,6 @@ def preprocess_fru_image_in_memory(
             mask = cv2.GaussianBlur(mask, (7, 7), 0)
             mask = (mask > 128).astype(np.uint8) * 255
 
-            # Mask 2: face-only (no hair) for stable scene placement
             face_only_mask = np.zeros(parsing.shape, dtype=np.uint8)
             for lid in _BISENET_FACE_ONLY:
                 face_only_mask[parsing == lid] = 255
@@ -784,7 +753,6 @@ def preprocess_fru_image_in_memory(
                 face_mask_crop = mask[y1_bs:y2_bs, x1_bs:x2_bs]
                 face_only_mask_crop = face_only_mask[y1_bs:y2_bs, x1_bs:x2_bs]
 
-                # Face-only bbox within crop (crop-local coordinates)
                 fo_rows = np.any(face_only_mask_crop > 0, axis=1)
                 fo_cols = np.any(face_only_mask_crop > 0, axis=0)
                 bisenet_face_box_in_crop = None
@@ -796,12 +764,10 @@ def preprocess_fru_image_in_memory(
                         int(np.where(fo_rows)[0][-1]),
                     )
 
-                # White-bg RGB for generation
                 face_crop_rgb = Image.new("RGB", face_crop_rgba.size, (255, 255, 255))
                 face_crop_rgb.paste(face_crop_rgba, mask=face_crop_rgba.split()[3])
                 face_img_rgb = _preprocess_for_sketch(face_crop_rgb, gamma=gamma, enhance_contrast=True)
 
-                # Face enhancement using remapped MTCNN box
                 if primary_face and enhance_faces:
                     fx1_m = max(0, primary_face["box"][0] - x1_bs)
                     fy1_m = max(0, primary_face["box"][1] - y1_bs)
@@ -815,7 +781,6 @@ def preprocess_fru_image_in_memory(
                     }
                     face_img_rgb = _enhance_face_region(face_img_rgb, remapped)
 
-                # Upscale if too small; track factor for box alignment
                 upscale_factor = 1.0
                 if min(face_img_rgb.size) < 512:
                     s = 512 / min(face_img_rgb.size)
@@ -832,7 +797,6 @@ def preprocess_fru_image_in_memory(
                 face_img   = face_img_rgb
                 face_edges = _make_edges_enhanced(face_img_rgb, preserve_details=preserve_details)
 
-                # face_box_in_sketch: BiSeNet face-only bbox scaled to generation dimensions
                 if bisenet_face_box_in_crop is not None:
                     bfx1, bfy1, bfx2, bfy2 = bisenet_face_box_in_crop
                     face_box_in_sketch = (

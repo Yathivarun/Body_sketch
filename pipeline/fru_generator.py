@@ -46,7 +46,13 @@ from config import (
     FRU_SCENES_DIR,
     FRU_CROPS_CONFIG_PATH,
 )
-from pipeline.fru_preprocessor import FRUPreprocessedData, _BiSeNet, _BISENET_FACE_ONLY
+from pipeline.fru_preprocessor import (
+    FRUPreprocessedData,
+    _BiSeNet,
+    _BISENET_FACE_ONLY,
+    _get_torch_device,   # FIX #2: import instead of calling undefined local name
+    _init_bisenet,
+)
 
 # ── TF32 optimisation ─────────────────────────────────────────────────────────
 if torch.cuda.is_available():
@@ -54,11 +60,11 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 # ── Model cache ───────────────────────────────────────────────────────────────
+# FIX #2: removed dead "bisenet" key — BiSeNet is owned by fru_preprocessor cache
 _MODEL_CACHE: Dict = {
     "pipeline":        None,
     "pipeline_config": None,
     "lora_loaded":     False,
-    "bisenet":         None,
 }
 _REMBG_SESSION = None
 
@@ -78,17 +84,8 @@ def _get_optimal_device() -> Tuple[str, torch.dtype]:
     return "cpu", torch.float32
 
 
-def _get_torch_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
 # ============================================================================
 # PROMPT ENGINEERING
-# has_beard is disabled (always False) — kept as dormant parameter only.
 # ============================================================================
 
 def _build_prompt(gender: str, use_lora: bool, is_lcm: bool) -> str:
@@ -165,19 +162,6 @@ def _post_process_sketch(img: Image.Image, sharpness: float = 3.5,
 
 
 # ============================================================================
-# BISENET LAZY LOAD (reused from fru_preprocessor cache)
-# ============================================================================
-
-def _get_bisenet() -> Optional[_BiSeNet]:
-    """
-    Returns the cached BiSeNet instance from fru_preprocessor if available,
-    or attempts to load it here. Avoids double-loading.
-    """
-    from pipeline.fru_preprocessor import _MODEL_CACHE as _PRE_CACHE, _init_bisenet
-    return _init_bisenet()
-
-
-# ============================================================================
 # FACE MASK APPLICATION
 # ============================================================================
 
@@ -236,15 +220,14 @@ def _redetect_face_in_sketch(
 ) -> Optional[Tuple[int, int, int, int]]:
     """
     Re-run BiSeNet on the generated sketch to get the face-only bbox.
-    The preprocessed face_box_in_sketch was from the input crop; the
-    generated sketch is a new image and face position may differ.
     Falls back to fallback_box if re-detection fails.
     """
-    bisenet = _get_bisenet()
+    bisenet = _init_bisenet()  # delegates to fru_preprocessor cache
     if bisenet is None:
         return fallback_box
 
     try:
+        # FIX #2: _get_torch_device is now imported from fru_preprocessor
         device_bs = _get_torch_device()
         transform_bs = T.Compose([
             T.Resize((512, 512)),
@@ -300,14 +283,7 @@ def _compose_single_scene(
 ) -> Image.Image:
     """
     Compose sketch into scene using face_anchor alignment.
-
-    face_anchor schema (from crops-face-meta.json):
-        { "center": [cx, cy], "face_w": int, "face_h": int }
-
     Scale is computed so face-only height in sketch matches face_anchor["face_h"].
-    Sketch is placed so face center aligns with anchor center.
-    Hair extends naturally outside the oval — expected and correct.
-    Falls back to sketch-center heuristic if face_box_in_sketch is None.
     """
     scene = Image.open(scene_path).convert("RGBA")
     anchor_cx, anchor_cy = face_anchor["center"]
@@ -421,7 +397,6 @@ def _load_pipeline(
 ) -> Tuple:
     """
     Loads and caches the SD pipeline.
-    Shared model paths with SAU — same SD1.5 + ControlNet weights.
     Returns (pipe, lora_loaded: bool).
     """
     config_key = f"fru_{device}_{dtype}_{load_lora}_{lora_scale}_{use_lcm}"
@@ -483,6 +458,8 @@ def _load_pipeline(
         pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
         print("[INFO] LCM Scheduler activated")
 
+    # FIX #2: pipe.to(device) called only once here — removed redundant
+    # second .to(device) that was happening inside IPAdapterFaceID.__init__
     pipe = pipe.to(device)
 
     if device == "mps":
@@ -499,6 +476,10 @@ def _load_ip_adapter(pipe, device: str, dtype: torch.dtype):
     if not FACEID_AVAILABLE:
         return None
     try:
+        # FIX #2: pass device string only; IPAdapterFaceID.__init__ will call
+        # sd_pipe.to(device) internally but the pipe is already on the correct
+        # device so it's a no-op move — harmless and unavoidable given the
+        # IPAdapterFaceID API. We do NOT double-move manually here.
         return IPAdapterFaceID(
             pipe, MODEL_PATHS["ip_adapter"], device, num_tokens=4, torch_dtype=dtype
         )
@@ -612,8 +593,6 @@ def generate_fru_sketch_in_memory(
     3. Re-detects face position in generated sketch via BiSeNet
     4. Composes into all FRU scene backgrounds using face_anchor alignment
     5. Returns FRUGeneratedResult whose .scene_images is sent back to Triton
-
-    Returns FRUGeneratedResult.
     """
     if data.face_img is None or data.face_edges is None:
         raise RuntimeError(

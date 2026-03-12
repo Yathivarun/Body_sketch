@@ -52,7 +52,7 @@ if torch.cuda.is_available():
 _MODEL_CACHE: Dict = {
     "pipeline":        None,
     "pipeline_config": None,
-    "lora_loaded":     False,   # tracks whether LoRA was baked in on last load
+    "lora_loaded":     False,
 }
 _REMBG_SESSION = None
 
@@ -74,8 +74,6 @@ def _get_optimal_device() -> Tuple[str, torch.dtype]:
 
 # ============================================================================
 # PROMPT ENGINEERING
-# Gender-specific, no beard logic anywhere.
-# 'unknown' gender gets a neutral prompt — controlnet + embedding guide identity.
 # ============================================================================
 
 _BASE_SKETCH_LCM = (
@@ -110,7 +108,7 @@ _GENDER_POSITIVE: Dict[str, str] = {
         ", feminine facial features, soft contours, delicate features, "
         "graceful jawline, expressive eyes, soft skin shading"
     ),
-    "unknown": "",  # neutral — let controlnet + embedding guide identity
+    "unknown": "",
 }
 
 _GENDER_NEGATIVE: Dict[str, str] = {
@@ -207,12 +205,9 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
     """
     Loads and caches the SD pipeline.
     Returns (pipe, lora_loaded: bool).
-    lora_loaded reflects what was actually baked in — from cache or fresh load.
     """
-
-    print("Loading pipeline fresh...")
-    _MODEL_CACHE["pipeline"] = None
-
+    # FIX #1: removed the erroneous _MODEL_CACHE["pipeline"] = None line
+    # that was forcing a full reload on every call.
     config_key = f"{device}_{dtype}_{load_lora}_{lora_scale}_{use_lcm}"
     if (_MODEL_CACHE["pipeline"] is not None
             and _MODEL_CACHE["pipeline_config"] == config_key):
@@ -252,23 +247,21 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
     lora_loaded = False
     if use_lcm:
         lcm_path = MODEL_PATHS["lcm_lora"]
-        print("LCM path:", lcm_path)
-        print("Exists:", Path(lcm_path).exists())
-
-        pipe.load_lora_weights(lcm_path,weight_name="pytorch_lora_weights.safetensors")
-        print("LCM LoRA loaded")
-
+        pipe.load_lora_weights(lcm_path, weight_name="pytorch_lora_weights.safetensors")
         pipe.fuse_lora(lora_scale=1.0)
-        print("LCM LoRA fused")
+        print("[INFO] LCM LoRA loaded and fused")
 
         if load_lora and Path(MODEL_PATHS["lora"]).exists():
-            pipe.load_lora_weights(MODEL_PATHS["lora"],weight_name="Pencil_Sketch_by_vizsumit.safetensors")
+            pipe.load_lora_weights(
+                MODEL_PATHS["lora"],
+                weight_name="Pencil_Sketch_by_vizsumit.safetensors",
+            )
             pipe.fuse_lora(lora_scale=lora_scale * 1.3)
             lora_loaded = True
-            print("Style LoRA loaded")
+            print("[INFO] Style LoRA loaded and fused")
 
         pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-        print("LCM Scheduler activated")
+        print("[INFO] LCM Scheduler activated")
 
     pipe = pipe.to(device)
 
@@ -278,7 +271,7 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
 
     _MODEL_CACHE["pipeline"]        = pipe
     _MODEL_CACHE["pipeline_config"] = config_key
-    _MODEL_CACHE["lora_loaded"]     = lora_loaded  # persist actual state for cache hits
+    _MODEL_CACHE["lora_loaded"]     = lora_loaded
 
     return pipe, lora_loaded
 
@@ -296,6 +289,50 @@ def _load_ip_adapter(pipe, device: str, dtype: torch.dtype):
 
 
 # ============================================================================
+# SILHOUETTE MASK — fills interior holes left by rembg
+# ============================================================================
+
+def _fill_silhouette_mask(alpha: np.ndarray) -> np.ndarray:
+    """
+    Takes the raw alpha channel from rembg (uint8, 0–255) and returns a
+    cleaned mask where ALL pixels inside the outer silhouette boundary are
+    opaque — eliminating hollow interior regions (gaps between arm and torso,
+    gaps between legs, transparent dress/body areas, etc.).
+
+    Strategy:
+      1. Threshold alpha → binary mask
+      2. Find all EXTERNAL contours only (cv2.RETR_EXTERNAL) — this ignores
+         any inner contour holes so we never see "inside" boundaries
+      3. Draw all external contours filled solid → unified solid mask
+      4. Light morphological close to seal any tiny edge gaps
+      5. Gaussian blur edges for a natural anti-aliased blend
+    """
+    # Step 1: binary threshold
+    _, binary = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
+
+    # Step 2: find only external contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return alpha
+
+    # Step 3: draw all external contours filled — handles split legs, arms, etc.
+    solid_mask = np.zeros_like(alpha)
+    cv2.drawContours(solid_mask, contours, -1, 255, thickness=cv2.FILLED)
+
+    # Step 4: morphological close to seal tiny gaps at silhouette edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    solid_mask = cv2.morphologyEx(solid_mask, cv2.MORPH_CLOSE, kernel)
+
+    # Step 5: soft edge blur so the pasted sketch blends naturally into scene
+    solid_mask = cv2.GaussianBlur(solid_mask, (3, 3), 0)
+    # Re-threshold after blur to keep edges clean but not perfectly hard
+    _, solid_mask = cv2.threshold(solid_mask, 128, 255, cv2.THRESH_BINARY)
+
+    return solid_mask
+
+
+# ============================================================================
 # SCENE COMPOSITION
 # ============================================================================
 
@@ -309,12 +346,34 @@ def _init_rembg():
 
 
 def _remove_sketch_background(img: Image.Image) -> Image.Image:
+    """
+    Removes background via rembg then fills interior silhouette holes so the
+    sketch is a solid opaque cutout with no hollow regions inside the person.
+    """
     if not REMBG_AVAILABLE:
         return img.convert("RGBA")
+
     _init_rembg()
+
     if img.mode != "RGBA":
         img = img.convert("RGB")
-    return remove(img, session=_REMBG_SESSION)
+
+    # Keep original RGB before rembg — rembg zeros out RGB under transparent
+    # pixels, so using its RGB would produce black interiors after mask fill.
+    original_rgb = img.convert("RGB")
+
+    # rembg background removal — gives RGBA; we only use its alpha channel
+    rgba = remove(img, session=_REMBG_SESSION)
+
+    # Extract raw alpha and fill any interior holes
+    alpha_raw = np.array(rgba.split()[3])
+    alpha_filled = _fill_silhouette_mask(alpha_raw)
+
+    # Reconstruct RGBA: original RGB (full sketch detail) + filled alpha mask
+    result = original_rgb.convert("RGBA")
+    result.putalpha(Image.fromarray(alpha_filled))
+
+    return result
 
 
 def _compose_single_scene(sketch_rgba: Image.Image, scene_path: Path,
@@ -363,7 +422,6 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
         scene_id = scene_file.stem
         if scene_id in crops_data:
             try:
-                # Load scene fresh inside each thread (PIL lazy-open is not thread-safe)
                 return _compose_single_scene(
                     sketch_transparent, scene_file, crops_data[scene_id][0]
                 )
@@ -469,7 +527,7 @@ class GeneratedResult:
     ):
         self.final_sketch  = final_sketch
         self.face_sketch   = face_sketch
-        self.scene_images  = scene_images   # these are what Triton returns to the caller
+        self.scene_images  = scene_images
 
 
 # ============================================================================
@@ -486,11 +544,6 @@ def generate_sketch_in_memory(
 ) -> GeneratedResult:
     """
     Generate sketch from PreprocessedData entirely in RAM.
-
-    Gender is read directly from data.gender, which is already resolved
-    upstream (JSON override > InsightFace detection > 'unknown').
-    No beard logic anywhere in this function.
-
     Returns GeneratedResult whose .scene_images is what gets sent back
     to the Triton client.
     """
