@@ -1,5 +1,5 @@
 """
-FRU Face Sketch Generation Pipeline — Memory-Only
+FRU Face Sketch Generation Pipeline - Memory-Only
 All processing runs in RAM. No files written to disk.
 Accepts FRUPreprocessedData, returns FRUGeneratedResult with scene images.
 """
@@ -37,7 +37,7 @@ try:
 except ImportError:
     REMBG_AVAILABLE = False
 
-# ── Config + sibling module import ────────────────────────────────────────────
+# -- Config + sibling module import --------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     MODEL_PATHS,
@@ -54,13 +54,13 @@ from pipeline.fru_preprocessor import (
     _init_bisenet,
 )
 
-# ── TF32 optimisation ─────────────────────────────────────────────────────────
+# -- TF32 optimisation ---------------------------------------------------------
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ── Model cache ───────────────────────────────────────────────────────────────
-# FIX #2: removed dead "bisenet" key — BiSeNet is owned by fru_preprocessor cache
+# -- Model cache ---------------------------------------------------------------
+# FIX #2: removed dead "bisenet" key - BiSeNet is owned by fru_preprocessor cache
 _MODEL_CACHE: Dict = {
     "pipeline":        None,
     "pipeline_config": None,
@@ -188,8 +188,8 @@ def _apply_face_mask(
         print("  [INFO] BiSeNet face mask applied to sketch")
         return final_rgba
 
-    # Fallback: rembg → binary threshold → largest contour → solid filled mask
-    print("  [WARN] No BiSeNet mask — falling back to rembg silhouette")
+    # Fallback: rembg -> binary threshold -> largest contour -> solid filled mask
+    print("  [WARN] No BiSeNet mask - falling back to rembg silhouette")
     global _REMBG_SESSION
     if _REMBG_SESSION is None and REMBG_AVAILABLE:
         try:
@@ -263,11 +263,11 @@ def _redetect_face_in_sketch(
             )
             return box
         else:
-            print("  [WARN] BiSeNet found no face in sketch — using preprocessed box")
+            print("  [WARN] BiSeNet found no face in sketch - using preprocessed box")
             return fallback_box
 
     except Exception as e:
-        print(f"  [WARN] BiSeNet re-detection failed: {e} — using preprocessed box")
+        print(f"  [WARN] BiSeNet re-detection failed: {e} - using preprocessed box")
         return fallback_box
 
 
@@ -295,7 +295,7 @@ def _compose_single_scene(
         face_cx_in_sketch = (fx1 + fx2) / 2.0
         face_cy_in_sketch = (fy1 + fy2) / 2.0
     else:
-        print("    [WARN] No face_box_in_sketch — using fallback center alignment")
+        print("    [WARN] No face_box_in_sketch - using fallback center alignment")
         actual_face_h = sketch_rgba.height // 2
         face_cx_in_sketch = sketch_rgba.width / 2.0
         face_cy_in_sketch = sketch_rgba.height / 2.0
@@ -320,7 +320,7 @@ def _run_scene_composition(
 ) -> List[Image.Image]:
     """
     Compose the face sketch into all FRU scene backgrounds.
-    Returns list of PIL Images — no files saved.
+    Returns list of PIL Images - no files saved.
     """
     if not FRU_SCENES_DIR.exists():
         print(f"  [INFO] No FRU scenes directory at {FRU_SCENES_DIR}, skipping.")
@@ -346,12 +346,12 @@ def _run_scene_composition(
         scene_meta = crops_data[scene_id]
         allowed_genders = scene_meta.get("gender", ["male", "female", "unknown"])
         if gender not in allowed_genders:
-            print(f"    — Skipped scene {scene_id} (gender mismatch)")
+            print(f"     Skipped scene {scene_id} (gender mismatch)")
             return None
 
         face_anchor = scene_meta.get("face_anchor")
         if not face_anchor:
-            print(f"    — Skipped scene {scene_id} (no face_anchor in config)")
+            print(f"     Skipped scene {scene_id} (no face_anchor in config)")
             return None
 
         try:
@@ -458,7 +458,7 @@ def _load_pipeline(
         pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
         print("[INFO] LCM Scheduler activated")
 
-    # FIX #2: pipe.to(device) called only once here — removed redundant
+    # FIX #2: pipe.to(device) called only once here - removed redundant
     # second .to(device) that was happening inside IPAdapterFaceID.__init__
     pipe = pipe.to(device)
 
@@ -478,7 +478,7 @@ def _load_ip_adapter(pipe, device: str, dtype: torch.dtype):
     try:
         # FIX #2: pass device string only; IPAdapterFaceID.__init__ will call
         # sd_pipe.to(device) internally but the pipe is already on the correct
-        # device so it's a no-op move — harmless and unavoidable given the
+        # device so it's a no-op move - harmless and unavoidable given the
         # IPAdapterFaceID API. We do NOT double-move manually here.
         return IPAdapterFaceID(
             pipe, MODEL_PATHS["ip_adapter"], device, num_tokens=4, torch_dtype=dtype
@@ -558,7 +558,7 @@ def _generate_single_sketch(
 
 
 # ============================================================================
-# FRUGeneratedResult — output container
+# FRUGeneratedResult - output container
 # ============================================================================
 
 class FRUGeneratedResult:
@@ -589,14 +589,14 @@ def generate_fru_sketch_in_memory(
     Generate face sketch from FRUPreprocessedData entirely in RAM.
 
     1. Generates face sketch via SD1.5 + ControlNet + IP-Adapter FaceID
-    2. Applies BiSeNet mask to sketch (or rembg fallback) → RGBA cutout
+    2. Applies BiSeNet mask to sketch (or rembg fallback) -> RGBA cutout
     3. Re-detects face position in generated sketch via BiSeNet
     4. Composes into all FRU scene backgrounds using face_anchor alignment
     5. Returns FRUGeneratedResult whose .scene_images is sent back to Triton
     """
     if data.face_img is None or data.face_edges is None:
         raise RuntimeError(
-            "FRUPreprocessedData has no face crop — cannot generate face sketch."
+            "FRUPreprocessedData has no face crop - cannot generate face sketch."
         )
 
     if device is None:
@@ -632,7 +632,7 @@ def generate_fru_sketch_in_memory(
         exposure=POSTPROCESS_PARAMS["exposure"],
     )
 
-    # Apply BiSeNet mask → RGBA cutout
+    # Apply BiSeNet mask -> RGBA cutout
     final_sketch_rgba = _apply_face_mask(final_sketch_rgb, data.face_mask_crop)
 
     # Re-detect face position in the generated sketch

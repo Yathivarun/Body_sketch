@@ -1,5 +1,5 @@
 """
-Portrait Sketch Preprocessing Pipeline — Memory-Only
+Portrait Sketch Preprocessing Pipeline - Memory-Only
 All processing runs in RAM. No files written to disk.
 """
 
@@ -13,12 +13,12 @@ from PIL import Image, ImageEnhance, ImageFilter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
-# ── TF32 optimisation (no xformers) ──────────────────────────────────────────
+# -- TF32 optimisation (no xformers) ------------------------------------------
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ── Optional heavy dependencies ───────────────────────────────────────────────
+# -- Optional heavy dependencies -----------------------------------------------
 try:
     from controlnet_aux import LineartDetector, HEDdetector
 except Exception:
@@ -45,11 +45,11 @@ try:
 except Exception:
     REMBG_AVAILABLE = False
 
-# ── Config import — works whether run from project root or as pipeline package ─
+# -- Config import - works whether run from project root or as pipeline package -
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import MODEL_PATHS, PREPROCESS_DEFAULTS
 
-# ── Module-level model cache ──────────────────────────────────────────────────
+# -- Module-level model cache --------------------------------------------------
 _MODEL_CACHE: Dict = {
     "insightface_app": None,
     "edge_detector":   None,
@@ -118,16 +118,36 @@ def _crop_to_content(img: Image.Image, padding_pct: float = 0.05) -> Tuple[Image
 
 def _apply_gamma_correction(img: Image.Image, gamma: float = 1.3) -> Image.Image:
     arr = np.array(img).astype(np.float32) / 255.0
-    corrected = (np.power(arr, 1.0 / gamma) * 255).astype(np.uint8)
-    return Image.fromarray(corrected)
+    corrected = np.power(arr, 1.0 / gamma)
+    # Protect highlights: pixels already near-white (> 0.80) get much less
+    # gamma lift to prevent light skin/fabric from blowing out to pure white.
+    # blend=0 at arr=0.80 (full correction), blend=1 at arr=1.0 (no correction).
+    blend = np.clip((arr - 0.80) / 0.20, 0, 1)
+    corrected = corrected * (1 - blend) + arr * blend
+    return Image.fromarray((corrected * 255).astype(np.uint8))
 
 
 def _adaptive_brighten(img: Image.Image, target_brightness: float = 0.55) -> Image.Image:
     arr = np.array(img).astype(np.float32) / 255.0
-    current = np.mean(arr)
+    # Measure brightness only on non-white pixels (person region).
+    # White background pixels (all channels > 0.92) would inflate the mean
+    # and cause light skin tones to be blown out.
+    if len(arr.shape) == 3:
+        non_white_mask = np.any(arr < 0.92, axis=-1)
+    else:
+        non_white_mask = arr < 0.92
+    if non_white_mask.sum() > 0:
+        current = float(np.mean(arr[non_white_mask]))
+    else:
+        current = float(np.mean(arr))
     if current < target_brightness:
-        factor = min(target_brightness / (current + 0.01), 1.8)
-        arr = np.clip(arr * factor, 0, 1)
+        factor = min(target_brightness / (current + 0.01), 1.5)
+        # Apply brightening only to non-white pixels to avoid blowing out
+        # already-light areas (pale skin, light clothing against white BG).
+        if len(arr.shape) == 3:
+            arr[non_white_mask] = np.clip(arr[non_white_mask] * factor, 0, 1)
+        else:
+            arr[non_white_mask] = np.clip(arr[non_white_mask] * factor, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
 
@@ -153,7 +173,11 @@ def _preprocess_for_sketch(img: Image.Image, gamma: float = 1.3,
     processed = _adaptive_brighten(processed, target_brightness=0.55)
     if enhance_contrast:
         processed = _enhance_local_contrast(processed)
-    return processed
+    # Final highlight clamp - hard cap at 245/255 so no area ever reaches
+    # pure white from cumulative processing. Pure white = invisible in lineart.
+    arr = np.array(processed)
+    arr = np.clip(arr, 0, 245)
+    return Image.fromarray(arr.astype(np.uint8))
 
 
 # ============================================================================
@@ -191,7 +215,7 @@ def _detect_all_faces(img: Image.Image) -> List[Dict]:
 
 
 # ============================================================================
-# GENDER DETECTION  (fallback only — JSON override is always preferred)
+# GENDER DETECTION  (fallback only - JSON override is always preferred)
 # ============================================================================
 
 def _detect_gender(img: Image.Image, face_box: Optional[Tuple] = None) -> str:
@@ -291,7 +315,7 @@ def _extract_face_embedding(img: Image.Image, face_box: Tuple) -> Optional[np.nd
 def _enhance_face_region(img: Image.Image, face: Dict,
                          padding: float = 0.2,
                          sharpen_strength: float = 1.5) -> Image.Image:
-    """Uniform face sharpening — no gender/beard variants."""
+    """Face enhancement with highlight suppression to reduce sweaty/rough skin texture."""
     x1, y1, x2, y2 = face["box"]
     w, h = x2 - x1, y2 - y1
     px, py = int(w * padding), int(h * padding)
@@ -300,16 +324,28 @@ def _enhance_face_region(img: Image.Image, face: Dict,
     rx2 = min(img.width, x2 + px)
     ry2 = min(img.height, y2 + py)
     face_region = img.crop((rx1, ry1, rx2, ry2))
-    face_region = ImageEnhance.Contrast(face_region).enhance(1.15)
+
+    # Suppress highlights before sharpening - converts blown-out bright skin
+    # pixels (sweat, oily skin) to mid-tones so lineart doesn't pick up texture.
+    arr = np.array(face_region).astype(np.float32) / 255.0
+    # Soft rolloff for pixels above 0.78 brightness - pulls them toward 0.82
+    highlight_mask = arr > 0.78
+    arr[highlight_mask] = 0.78 + (arr[highlight_mask] - 0.78) * 0.45
+    face_region = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # Mild contrast boost (reduced from 1.15 to avoid amplifying skin texture)
+    face_region = ImageEnhance.Contrast(face_region).enhance(1.08)
+
+    # Softer sharpening - reduced radius and percent to avoid exaggerating pores
     sharp = face_region.filter(
-        ImageFilter.UnsharpMask(radius=1.2, percent=int(150 * sharpen_strength))
+        ImageFilter.UnsharpMask(radius=0.8, percent=int(90 * sharpen_strength))
     )
     img.paste(sharp, (rx1, ry1))
     return img
 
 
 def _make_edges_enhanced(img: Image.Image, preserve_details: bool = True) -> Image.Image:
-    """Generate edge map. Tries Lineart → HED → Canny fallback."""
+    """Generate edge map. Tries Lineart -> HED -> Canny fallback."""
     if LineartDetector:
         try:
             if _MODEL_CACHE["edge_detector"] is None:
@@ -368,9 +404,9 @@ def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
     Background removal, content crop, and white-BG composite.
 
     Returns:
-        cropped_rgba  — subject on transparent background (for gender/ID detection)
-        img_white_bg  — subject on white background (for sketch/edges)
-        crop_info     — crop metadata dict
+        cropped_rgba  - subject on transparent background (for gender/ID detection)
+        img_white_bg  - subject on white background (for sketch/edges)
+        crop_info     - crop metadata dict
     """
     if not REMBG_AVAILABLE:
         raise ImportError("rembg not installed: pip install rembg")
@@ -390,7 +426,7 @@ def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
 
 
 # ============================================================================
-# PreprocessedData — in-memory result container
+# PreprocessedData - in-memory result container
 # ============================================================================
 
 class PreprocessedData:
@@ -464,7 +500,7 @@ def preprocess_image_in_memory(
     primary_face = all_faces[0] if all_faces else None
 
     # 4. Gender resolution
-    #    Priority: JSON override → InsightFace detection → 'unknown'
+    #    Priority: JSON override -> InsightFace detection -> 'unknown'
     override = gender_override.strip().lower() if gender_override else None
     if override in ("male", "female"):
         gender = override
@@ -474,9 +510,9 @@ def preprocess_image_in_memory(
         print(f"  [INFO] Gender from detection: {gender}")
     else:
         gender = "unknown"
-        print("  [WARN] Gender unknown — no face detected and no JSON override provided")
+        print("  [WARN] Gender unknown - no face detected and no JSON override provided")
 
-    # 5. Face enhancement — uniform sharpening, no gender/beard variants
+    # 5. Face enhancement - uniform sharpening, no gender/beard variants
     enhanced = img_corrected.copy()
     if primary_face and enhance_faces:
         enhanced = _enhance_face_region(enhanced, primary_face)

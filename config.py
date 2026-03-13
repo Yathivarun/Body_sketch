@@ -1,7 +1,7 @@
 """
 Central configuration for the sketch pipeline.
 All paths, model locations, and tunable defaults live here.
-Edit this file when deploying to a new environment — nothing else should need changing.
+Edit this file when deploying to a new environment - nothing else should need changing.
 """
 
 from pathlib import Path
@@ -14,10 +14,10 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).parent
 
-# Model weights — volume-mounted at /app/models/ inside Docker
+# Model weights - volume-mounted at /app/models/ inside Docker
 MODELS_ROOT = _PROJECT_ROOT / "models"
 
-# Scene backgrounds and crop configuration — volume-mounted at /app/inputs/
+# Scene backgrounds and crop configuration - volume-mounted at /app/inputs/
 SCENES_DIR        = _PROJECT_ROOT / "inputs" / "scenes"
 CROPS_CONFIG_PATH = _PROJECT_ROOT / "crops.json"
 
@@ -53,7 +53,7 @@ MODEL_PATHS = {
     "annotators_lineart": str(MODELS_ROOT / "annotators" / "lineart"),
     "annotators_hed":     str(MODELS_ROOT / "annotators" / "hed"),
 
-    # BiSeNet face parsing — used by FRU pipeline only
+    # BiSeNet face parsing - used by FRU pipeline only
     "bisenet": str(MODELS_ROOT / "bisenet" / "bisenet_face_parsing.pth"),
 }
 

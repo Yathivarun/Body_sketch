@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: sketch-triton:latest
-    container_name: sketch-triton
+    container_name: full-sketch
 
     # ── GPU access ────────────────────────────────────────────────────────────
     deploy:
@@ -19,9 +19,9 @@ services:
 
     # ── Ports ─────────────────────────────────────────────────────────────────
     ports:
-      - "8000:8000"   # HTTP inference
-      - "8001:8001"   # gRPC inference
-      - "8002:8002"   # Prometheus metrics
+      - "18000:8000"   # HTTP inference
+      - "18001:8001"   # gRPC inference
+      - "18002:8002"   # Prometheus metrics
 
     # ── Volume mounts — nothing large is baked into the image ─────────────────
     volumes:

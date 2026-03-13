@@ -21,3 +21,5 @@ models/
 .vscode/
 .idea/
 .DS_Store
+
+local_test_output/

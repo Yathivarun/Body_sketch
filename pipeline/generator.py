@@ -1,5 +1,5 @@
 """
-Portrait Sketch Generation Pipeline — Memory-Only
+Portrait Sketch Generation Pipeline - Memory-Only
 All processing runs in RAM. No files written to disk.
 Returns List[PIL.Image] of scene-composed images.
 """
@@ -35,7 +35,7 @@ try:
 except ImportError:
     REMBG_AVAILABLE = False
 
-# ── Config + sibling module import ────────────────────────────────────────────
+# -- Config + sibling module import --------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     MODEL_PATHS, GENERATION_DEFAULTS, POSTPROCESS_PARAMS,
@@ -43,12 +43,12 @@ from config import (
 )
 from pipeline.preprocessor import PreprocessedData
 
-# ── TF32 optimisation (no xformers) ──────────────────────────────────────────
+# -- TF32 optimisation (no xformers) ------------------------------------------
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ── Model cache ───────────────────────────────────────────────────────────────
+# -- Model cache ---------------------------------------------------------------
 _MODEL_CACHE: Dict = {
     "pipeline":        None,
     "pipeline_config": None,
@@ -233,7 +233,7 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
             use_safetensors=True,
         )
 
-    # ── TAESD (tiny VAE for fast LCM decoding) ────────────────────────────────
+    # -- TAESD (tiny VAE for fast LCM decoding) --------------------------------
     if use_lcm:
         try:
             pipe.vae = AutoencoderTiny.from_pretrained(
@@ -243,7 +243,7 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
         except Exception as e:
             print(f"[WARN] TAESD loading failed: {e}")
 
-    # ── LoRA loading ──────────────────────────────────────────────────────────
+    # -- LoRA loading ----------------------------------------------------------
     lora_loaded = False
     if use_lcm:
         lcm_path = MODEL_PATHS["lcm_lora"]
@@ -289,21 +289,21 @@ def _load_ip_adapter(pipe, device: str, dtype: torch.dtype):
 
 
 # ============================================================================
-# SILHOUETTE MASK — fills interior holes left by rembg
+# SILHOUETTE MASK - fills interior holes left by rembg
 # ============================================================================
 
 def _fill_silhouette_mask(alpha: np.ndarray) -> np.ndarray:
     """
-    Takes the raw alpha channel from rembg (uint8, 0–255) and returns a
+    Takes the raw alpha channel from rembg (uint8, 0-255) and returns a
     cleaned mask where ALL pixels inside the outer silhouette boundary are
-    opaque — eliminating hollow interior regions (gaps between arm and torso,
+    opaque - eliminating hollow interior regions (gaps between arm and torso,
     gaps between legs, transparent dress/body areas, etc.).
 
     Strategy:
-      1. Threshold alpha → binary mask
-      2. Find all EXTERNAL contours only (cv2.RETR_EXTERNAL) — this ignores
+      1. Threshold alpha -> binary mask
+      2. Find all EXTERNAL contours only (cv2.RETR_EXTERNAL) - this ignores
          any inner contour holes so we never see "inside" boundaries
-      3. Draw all external contours filled solid → unified solid mask
+      3. Draw all external contours filled solid -> unified solid mask
       4. Light morphological close to seal any tiny edge gaps
       5. Gaussian blur edges for a natural anti-aliased blend
     """
@@ -316,7 +316,7 @@ def _fill_silhouette_mask(alpha: np.ndarray) -> np.ndarray:
     if not contours:
         return alpha
 
-    # Step 3: draw all external contours filled — handles split legs, arms, etc.
+    # Step 3: draw all external contours filled - handles split legs, arms, etc.
     solid_mask = np.zeros_like(alpha)
     cv2.drawContours(solid_mask, contours, -1, 255, thickness=cv2.FILLED)
 
@@ -358,11 +358,11 @@ def _remove_sketch_background(img: Image.Image) -> Image.Image:
     if img.mode != "RGBA":
         img = img.convert("RGB")
 
-    # Keep original RGB before rembg — rembg zeros out RGB under transparent
+    # Keep original RGB before rembg - rembg zeros out RGB under transparent
     # pixels, so using its RGB would produce black interiors after mask fill.
     original_rgb = img.convert("RGB")
 
-    # rembg background removal — gives RGBA; we only use its alpha channel
+    # rembg background removal - gives RGBA; we only use its alpha channel
     rgba = remove(img, session=_REMBG_SESSION)
 
     # Extract raw alpha and fill any interior holes
@@ -395,7 +395,7 @@ def _compose_single_scene(sketch_rgba: Image.Image, scene_path: Path,
 def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Image]:
     """
     Composes the sketch into all available scene backgrounds.
-    Returns a list of PIL Images — no files saved.
+    Returns a list of PIL Images - no files saved.
     """
     if not SCENES_DIR.exists():
         print(f"[INFO] No scenes directory at {SCENES_DIR}, skipping composition.")
@@ -513,7 +513,7 @@ def _generate_single_sketch(
 
 
 # ============================================================================
-# GeneratedResult — output container
+# GeneratedResult - output container
 # ============================================================================
 
 class GeneratedResult:

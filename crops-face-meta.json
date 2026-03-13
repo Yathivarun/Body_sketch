@@ -2,10 +2,10 @@
   "_schema_notes": {
     "description": "FRU face scene crop configuration. Each key is the scene image filename stem (without extension).",
     "face_anchor": {
-      "center": "[cx, cy] — pixel coordinate in the scene image where the face center should be placed",
+      "center": "[cx, cy] - pixel coordinate in the scene image where the face center should be placed",
       "face_w":  "Width in pixels of the oval face placement zone in the scene (face-only skin region, no hair)",
       "face_h":  "Height in pixels of the oval face placement zone in the scene (face-only skin region, no hair)",
-      "bbox":    "[x1, y1, x2, y2] — bounding box of the oval face placement zone in the scene image (for reference only, not used by pipeline)"
+      "bbox":    "[x1, y1, x2, y2] - bounding box of the oval face placement zone in the scene image (for reference only, not used by pipeline)"
     },
     "gender": "List of allowed genders for this scene. Values: 'male', 'female', 'unknown'. Omit to allow all."
   },

@@ -1,5 +1,5 @@
 """
-FRU Face Sketch Preprocessing Pipeline — Memory-Only
+FRU Face Sketch Preprocessing Pipeline - Memory-Only
 All processing runs in RAM. No files written to disk.
 Returns FRUPreprocessedData for consumption by fru_generator.py
 """
@@ -15,12 +15,12 @@ import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from typing import Dict, List, Optional, Tuple
 
-# ── TF32 optimisation ─────────────────────────────────────────────────────────
+# -- TF32 optimisation ---------------------------------------------------------
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ── Optional heavy dependencies ───────────────────────────────────────────────
+# -- Optional heavy dependencies -----------------------------------------------
 try:
     from controlnet_aux import LineartDetector, HEDdetector
 except Exception:
@@ -47,11 +47,11 @@ try:
 except Exception:
     REMBG_AVAILABLE = False
 
-# ── Config import ─────────────────────────────────────────────────────────────
+# -- Config import -------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import MODEL_PATHS, PREPROCESS_DEFAULTS
 
-# ── Module-level model cache ──────────────────────────────────────────────────
+# -- Module-level model cache --------------------------------------------------
 _MODEL_CACHE: Dict = {
     "insightface_app": None,
     "edge_detector":   None,
@@ -60,7 +60,7 @@ _MODEL_CACHE: Dict = {
 }
 _REMBG_SESSION = None
 
-# ── BiSeNet label groups ──────────────────────────────────────────────────────
+# -- BiSeNet label groups ------------------------------------------------------
 _BISENET_FACE_NO_NECK   = [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13]
 _BISENET_FACE_WITH_HAIR = [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 17]
 _BISENET_FACE_ONLY      = [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13]
@@ -275,7 +275,7 @@ def _init_bisenet() -> Optional[_BiSeNet]:
 
     model_path = MODEL_PATHS.get("bisenet", "")
     if not model_path or not __import__("pathlib").Path(model_path).exists():
-        print(f"  [WARN] BiSeNet model not found at '{model_path}' — falling back to rembg cutout")
+        print(f"  [WARN] BiSeNet model not found at '{model_path}' - falling back to rembg cutout")
         return None
     try:
         device = _get_torch_device()
@@ -291,7 +291,7 @@ def _init_bisenet() -> Optional[_BiSeNet]:
         print(f"  [INFO] BiSeNet loaded on {device}")
         return net
     except Exception as e:
-        print(f"  [WARN] BiSeNet load failed: {e} — falling back to rembg cutout")
+        print(f"  [WARN] BiSeNet load failed: {e} - falling back to rembg cutout")
         return None
 
 
@@ -328,10 +328,25 @@ def _apply_gamma_correction(img: Image.Image, gamma: float = 1.3) -> Image.Image
 
 def _adaptive_brighten(img: Image.Image, target_brightness: float = 0.55) -> Image.Image:
     arr = np.array(img).astype(np.float32) / 255.0
-    current = np.mean(arr)
+    # Measure brightness only on non-white pixels (person region).
+    # White background pixels (all channels > 0.92) would inflate the mean
+    # and cause light skin tones to be blown out.
+    if len(arr.shape) == 3:
+        non_white_mask = np.any(arr < 0.92, axis=-1)
+    else:
+        non_white_mask = arr < 0.92
+    if non_white_mask.sum() > 0:
+        current = float(np.mean(arr[non_white_mask]))
+    else:
+        current = float(np.mean(arr))
     if current < target_brightness:
-        factor = min(target_brightness / (current + 0.01), 1.8)
-        arr = np.clip(arr * factor, 0, 1)
+        factor = min(target_brightness / (current + 0.01), 1.5)
+        # Apply brightening only to non-white pixels to avoid blowing out
+        # already-light areas (pale skin, light clothing against white BG).
+        if len(arr.shape) == 3:
+            arr[non_white_mask] = np.clip(arr[non_white_mask] * factor, 0, 1)
+        else:
+            arr[non_white_mask] = np.clip(arr[non_white_mask] * factor, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
 
@@ -513,6 +528,7 @@ def _extract_face_embedding(img: Image.Image, face_box: Tuple) -> Optional[np.nd
 def _enhance_face_region(img: Image.Image, face: Dict,
                           padding: float = 0.2,
                           sharpen_strength: float = 1.5) -> Image.Image:
+    """Face enhancement with highlight suppression to reduce sweaty/rough skin texture."""
     x1, y1, x2, y2 = face["box"]
     w, h = x2 - x1, y2 - y1
     px, py = int(w * padding), int(h * padding)
@@ -521,9 +537,20 @@ def _enhance_face_region(img: Image.Image, face: Dict,
     rx2 = min(img.width, x2 + px)
     ry2 = min(img.height, y2 + py)
     face_region = img.crop((rx1, ry1, rx2, ry2))
-    face_region = ImageEnhance.Contrast(face_region).enhance(1.15)
+
+    # Suppress highlights before sharpening - converts blown-out bright skin
+    # pixels (sweat, oily skin) to mid-tones so lineart doesn't pick up texture.
+    arr = np.array(face_region).astype(np.float32) / 255.0
+    highlight_mask = arr > 0.78
+    arr[highlight_mask] = 0.78 + (arr[highlight_mask] - 0.78) * 0.45
+    face_region = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # Mild contrast boost (reduced from 1.15 to avoid amplifying skin texture)
+    face_region = ImageEnhance.Contrast(face_region).enhance(1.08)
+
+    # Softer sharpening - reduced radius and percent to avoid exaggerating pores
     sharp = face_region.filter(
-        ImageFilter.UnsharpMask(radius=1.2, percent=int(150 * sharpen_strength))
+        ImageFilter.UnsharpMask(radius=0.8, percent=int(90 * sharpen_strength))
     )
     img.paste(sharp, (rx1, ry1))
     return img
@@ -609,7 +636,7 @@ def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
 
 
 # ============================================================================
-# FRUPreprocessedData — in-memory result container
+# FRUPreprocessedData - in-memory result container
 # ============================================================================
 
 class FRUPreprocessedData:
@@ -672,7 +699,7 @@ def preprocess_fru_image_in_memory(
     all_faces = _detect_all_faces(img_corrected)
     primary_face = all_faces[0] if all_faces else None
 
-    # 4. Gender resolution: override → detection → unknown
+    # 4. Gender resolution: override -> detection -> unknown
     override = gender_override.strip().lower() if gender_override else None
     if override in ("male", "female"):
         gender = override
@@ -682,7 +709,7 @@ def preprocess_fru_image_in_memory(
         print(f"  [INFO] Gender from detection: {gender}")
     else:
         gender = "unknown"
-        print("  [WARN] Gender unknown — no face detected and no override provided")
+        print("  [WARN] Gender unknown - no face detected and no override provided")
 
     # 5. Face enhancement
     enhanced = img_corrected.copy()
@@ -696,7 +723,7 @@ def preprocess_fru_image_in_memory(
         if faceid_embedding is not None:
             print(f"  [INFO] Face embedding extracted: shape {faceid_embedding.shape}")
         else:
-            print("  [WARN] Face embedding returned None — IP-Adapter will be skipped")
+            print("  [WARN] Face embedding returned None - IP-Adapter will be skipped")
 
     # 7. BiSeNet face crop
     face_img = None
@@ -817,14 +844,14 @@ def preprocess_fru_image_in_memory(
                         int(fx2_m * upscale_factor),
                         int(fy2_m * upscale_factor),
                     )
-                    print(f"  [WARN] BiSeNet face-only mask empty — fell back to MTCNN bbox")
+                    print(f"  [WARN] BiSeNet face-only mask empty - fell back to MTCNN bbox")
                 else:
                     print("  [WARN] No face box available for scene placement")
             else:
-                print("  [WARN] BiSeNet found no face regions — will skip generation")
+                print("  [WARN] BiSeNet found no face regions - will skip generation")
 
         except Exception as e:
-            print(f"  [WARN] BiSeNet crop failed: {e} — falling back to oval crop")
+            print(f"  [WARN] BiSeNet crop failed: {e} - falling back to oval crop")
             bisenet_net = None
 
     # Fallback: oval crop if BiSeNet unavailable or failed
