@@ -23,3 +23,7 @@ models/
 .DS_Store
 
 local_test_output/
+test/
+
+.ipynb_checkpoints/
+position.ipynb
