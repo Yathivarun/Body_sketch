@@ -183,6 +183,33 @@ def _preprocess_for_sketch(img: Image.Image, gamma: float = 1.3,
     return Image.fromarray(arr.astype(np.uint8))
 
 
+def _preprocess_for_edges(img: Image.Image) -> Image.Image:
+    """
+    Edge-map stream preprocessing — NO brightening.
+
+    Skips gamma correction and adaptive brightening entirely so that
+    highlights are never blown out to pure white before the Lineart
+    detector runs.  Instead applies an aggressive CLAHE pass in
+    grayscale to maximise local edge contrast without clipping.
+
+    Args:
+        img: RGB PIL Image (white-background composite).
+
+    Returns:
+        RGB PIL Image ready to be fed into _make_edges_enhanced.
+    """
+    try:
+        img_cv = np.array(img)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply(gray)
+        rgb_eq = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(rgb_eq)
+    except cv2.error:
+        logger.warning("Edge preprocessing CLAHE failed, returning original", exc_info=True)
+        return img
+
+
 # ============================================================================
 # FACE DETECTION
 # ============================================================================
@@ -412,6 +439,10 @@ def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
     """
     Background removal, content crop, and white-BG composite.
 
+    Alpha-aware: if the input is already RGBA and more than 5 % of pixels have
+    alpha < 250, the rembg pass is skipped entirely to prevent edge erosion on
+    subjects like fingers or shoes that touch the frame boundary.
+
     Returns:
         cropped_rgba  - subject on transparent background (for gender/ID detection)
         img_white_bg  - subject on white background (for sketch/edges)
@@ -425,8 +456,25 @@ def segment_and_crop(img: Image.Image) -> Tuple[Image.Image, Image.Image, Dict]:
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
 
-    segmented = remove(img, session=_REMBG_SESSION)           # always returns RGBA
-    cropped_rgba, crop_info = _crop_to_content(segmented, padding_pct=0.05)
+    # -- Alpha-aware rembg bypass -------------------------------------------------
+    skip_rembg = False
+    if img.mode == "RGBA":
+        alpha_arr = np.array(img.getchannel("A"))
+        transparent_ratio = float(np.mean(alpha_arr < 250))
+        if transparent_ratio > 0.05:
+            skip_rembg = True
+            logger.info(
+                "Skipping rembg: %.1f%% of pixels already transparent",
+                transparent_ratio * 100,
+            )
+
+    if skip_rembg:
+        # Image already has a clean alpha channel — use it directly.
+        cropped_rgba, crop_info = _crop_to_content(img, padding_pct=0.05)
+    else:
+        logger.info("Running rembg background removal")
+        segmented = remove(img, session=_REMBG_SESSION)       # always returns RGBA
+        cropped_rgba, crop_info = _crop_to_content(segmented, padding_pct=0.05)
 
     white_bg = Image.new("RGB", cropped_rgba.size, (255, 255, 255))
     white_bg.paste(cropped_rgba, mask=cropped_rgba.split()[3])
@@ -501,11 +549,22 @@ def preprocess_image_in_memory(
     cropped_rgba, img_white_bg, crop_info = segment_and_crop(img)
     current_size = img_white_bg.size
 
-    # 2. Corrections on white-BG version (used for sketch/edges)
-    img_corrected = _preprocess_for_sketch(img_white_bg, gamma=gamma, enhance_contrast=True)
+    # 2. Split into two processing streams from the same white-BG source:
+    #
+    #    img_for_sd   — gamma + adaptive brightening + local contrast.
+    #                   Used for face detection, face enhancement, and the
+    #                   `enhanced` image fed to Stable Diffusion.
+    #
+    #    img_for_edges — grayscale + aggressive CLAHE only (NO brightening).
+    #                   Used exclusively to derive body and face edge maps so
+    #                   that highlights are never blown out before the Lineart
+    #                   detector runs, preventing missing limbs / outlines.
+    img_for_sd = _preprocess_for_sketch(img_white_bg, gamma=gamma, enhance_contrast=True)
+    img_for_edges = _preprocess_for_edges(img_white_bg)
+    logger.info("Dual stream split: img_for_sd and img_for_edges created")
 
-    # 3. Face detection
-    all_faces = _detect_all_faces(img_corrected)
+    # 3. Face detection (run on the SD stream — brightness helps MTCNN)
+    all_faces = _detect_all_faces(img_for_sd)
     primary_face = all_faces[0] if all_faces else None
 
     # 4. Gender resolution
@@ -524,7 +583,8 @@ def preprocess_image_in_memory(
         )
 
     # 5. Face enhancement - uniform sharpening, no gender/beard variants
-    enhanced = img_corrected.copy()
+    #    Applied to the SD stream; result becomes the `enhanced` output.
+    enhanced = img_for_sd.copy()
     if primary_face and enhance_faces:
         enhanced = _enhance_face_region(enhanced, primary_face)
 
@@ -536,8 +596,9 @@ def preprocess_image_in_memory(
             logger.info("Face embedding extracted: shape %s", faceid_embedding.shape)
 
     # 7. Parallel edge map generation (body + face)
+    #    Both threads consume img_for_edges (the unbrightened CLAHE stream).
     def process_body_edges():
-        b_edges = _make_edges_enhanced(enhanced, preserve_details=preserve_details)
+        b_edges = _make_edges_enhanced(img_for_edges, preserve_details=preserve_details)
         if max(b_edges.size) > 1024:
             s = 1024 / max(b_edges.size)
             b_edges = b_edges.resize(
@@ -548,14 +609,24 @@ def preprocess_image_in_memory(
     def process_face_data():
         if not primary_face:
             return None, None, None
-        f_img, f_box = _crop_face_with_padding(enhanced, primary_face["box"])
-        if min(f_img.size) < 512:
-            s = 512 / min(f_img.size)
-            f_img = f_img.resize(
-                (int(f_img.width * s), int(f_img.height * s)), Image.LANCZOS
+        # Crop the face bounding box from img_for_edges (not from enhanced /
+        # img_for_sd) so the lineart detector sees unbrightened edge contrast.
+        f_img_edges, f_box = _crop_face_with_padding(img_for_edges, primary_face["box"])
+        # Return the SD-stream face crop as f_img (used by SD for face reference)
+        # but generate edges from the edge stream crop.
+        f_img_sd, _ = _crop_face_with_padding(enhanced, primary_face["box"])
+        if min(f_img_edges.size) < 512:
+            s = 512 / min(f_img_edges.size)
+            f_img_edges = f_img_edges.resize(
+                (int(f_img_edges.width * s), int(f_img_edges.height * s)), Image.LANCZOS
             )
-        f_edges = _make_edges_enhanced(f_img, preserve_details=preserve_details)
-        return f_img, f_edges, f_box
+        if min(f_img_sd.size) < 512:
+            s = 512 / min(f_img_sd.size)
+            f_img_sd = f_img_sd.resize(
+                (int(f_img_sd.width * s), int(f_img_sd.height * s)), Image.LANCZOS
+            )
+        f_edges = _make_edges_enhanced(f_img_edges, preserve_details=preserve_details)
+        return f_img_sd, f_edges, f_box
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_body = executor.submit(process_body_edges)
