@@ -2,6 +2,10 @@
 Central configuration for the sketch pipeline.
 All paths, model locations, and tunable defaults live here.
 Edit this file when deploying to a new environment - nothing else should need changing.
+
+NOTE: All from_pretrained() / from_config() calls in the pipeline modules use
+local_files_only=True.  No network access to Hugging Face will ever be attempted
+at runtime; every weight must be present under MODELS_ROOT before the server starts.
 """
 
 from pathlib import Path

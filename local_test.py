@@ -17,9 +17,19 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 from PIL import Image
+
+# ── Logging — configure before any pipeline imports so all child loggers inherit ─
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
 
 # ── Make sure project root is on path ─────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
@@ -38,24 +48,27 @@ def run_sau(image_path: str, person_id: str, gender: str):
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    print(f"\n{'='*60}")
-    print(f"Pipeline : SAU (full-body sketch)")
-    print(f"Input    : {image_path}")
-    print(f"ID       : {person_id}")
-    print(f"Gender   : {gender or 'not provided — will auto-detect'}")
-    print(f"{'='*60}\n")
+    logger.info("=" * 60)
+    logger.info("Pipeline : SAU (full-body sketch)")
+    logger.info("Input    : %s", image_path)
+    logger.info("ID       : %s", person_id)
+    logger.info(
+        "Gender   : %s",
+        gender if gender else "not provided — will auto-detect",
+    )
+    logger.info("=" * 60)
 
     img = Image.open(image_path)
 
     # ── Preprocess ─────────────────────────────────────────────────────────
-    print("[STEP 1/2] Preprocessing...")
+    logger.info("[STEP 1/2] Preprocessing...")
     gender_override = gender if gender in ("male", "female") else None
     data = preprocess_image_in_memory(img, gender_override=gender_override)
 
-    print(f"\n  Resolved gender : {data.gender}")
-    print(f"  Original size   : {data.original_size}")
-    print(f"  Face detected   : {data.primary_face is not None}")
-    print(f"  Face embedding  : {data.has_face_embedding}")
+    logger.info("Resolved gender : %s", data.gender)
+    logger.info("Original size   : %s", data.original_size)
+    logger.info("Face detected   : %s", data.primary_face is not None)
+    logger.info("Face embedding  : %s", data.has_face_embedding)
 
     # Save preprocessing intermediates
     preprocess_dir = OUTPUT_DIR / f"{person_id}_sau_preprocess"
@@ -66,28 +79,28 @@ def run_sau(image_path: str, person_id: str, gender: str):
         data.face_img.save(preprocess_dir / "face_cropped.jpg", quality=95)
     if data.face_edges is not None:
         data.face_edges.save(preprocess_dir / "face_edges.png")
-    print(f"\n  Preprocessing intermediates saved to: {preprocess_dir}/")
+    logger.info("Preprocessing intermediates saved to: %s/", preprocess_dir)
 
     # ── Generate ───────────────────────────────────────────────────────────
-    print("\n[STEP 2/2] Generating sketches...")
+    logger.info("[STEP 2/2] Generating sketches...")
     result = generate_sketch_in_memory(data)
 
     sketch_path = OUTPUT_DIR / f"{person_id}_sau_final_sketch.jpg"
     result.final_sketch.save(sketch_path, quality=95)
-    print(f"\n  Final sketch saved : {sketch_path}")
+    logger.info("Final sketch saved : %s", sketch_path)
 
     if result.face_sketch is not None:
         face_path = OUTPUT_DIR / f"{person_id}_sau_face_sketch.jpg"
         result.face_sketch.save(face_path, quality=95)
-        print(f"  Face sketch saved  : {face_path}")
+        logger.info("Face sketch saved  : %s", face_path)
 
     if result.scene_images:
         for i, scene_img in enumerate(result.scene_images):
             scene_path = OUTPUT_DIR / f"{person_id}_sau_scene_{i:03d}.jpg"
             scene_img.save(scene_path, quality=95)
-        print(f"  Scenes saved       : {len(result.scene_images)} image(s)")
+        logger.info("Scenes saved       : %d image(s)", len(result.scene_images))
     else:
-        print("  No scenes (check inputs/scenes/ and crops.json)")
+        logger.info("No scenes (check inputs/scenes/ and crops.json)")
 
 
 # ============================================================================
@@ -100,27 +113,34 @@ def run_fru(image_path: str, person_id: str, gender: str):
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    print(f"\n{'='*60}")
-    print(f"Pipeline : FRU (face sketch)")
-    print(f"Input    : {image_path}")
-    print(f"ID       : {person_id}")
-    print(f"Gender   : {gender or 'not provided — will auto-detect'}")
-    print(f"{'='*60}\n")
+    logger.info("=" * 60)
+    logger.info("Pipeline : FRU (face sketch)")
+    logger.info("Input    : %s", image_path)
+    logger.info("ID       : %s", person_id)
+    logger.info(
+        "Gender   : %s",
+        gender if gender else "not provided — will auto-detect",
+    )
+    logger.info("=" * 60)
 
     img = Image.open(image_path)
 
     # ── Preprocess ─────────────────────────────────────────────────────────
-    print("[STEP 1/2] Preprocessing...")
+    logger.info("[STEP 1/2] Preprocessing...")
     gender_override = gender if gender in ("male", "female") else None
     data = preprocess_fru_image_in_memory(img, gender_override=gender_override)
 
-    print(f"\n  Resolved gender     : {data.gender}")
-    print(f"  Original size       : {data.original_size}")
-    print(f"  Face detected       : {data.primary_face is not None}")
-    print(f"  Face embedding      : {data.has_face_embedding}")
-    print(f"  BiSeNet crop box    : {data.face_crop_box}")
-    print(f"  Face box in sketch  : {data.face_box_in_sketch}")
-    print(f"  BiSeNet mask        : {'available' if data.face_mask_crop is not None else 'not available (rembg fallback will be used)'}")
+    logger.info("Resolved gender     : %s", data.gender)
+    logger.info("Original size       : %s", data.original_size)
+    logger.info("Face detected       : %s", data.primary_face is not None)
+    logger.info("Face embedding      : %s", data.has_face_embedding)
+    logger.info("BiSeNet crop box    : %s", data.face_crop_box)
+    logger.info("Face box in sketch  : %s", data.face_box_in_sketch)
+    logger.info(
+        "BiSeNet mask        : %s",
+        "available" if data.face_mask_crop is not None
+        else "not available (rembg fallback will be used)",
+    )
 
     # Save preprocessing intermediates
     preprocess_dir = OUTPUT_DIR / f"{person_id}_fru_preprocess"
@@ -135,28 +155,30 @@ def run_fru(image_path: str, person_id: str, gender: str):
         from PIL import Image as _Image
         _Image.fromarray(data.face_mask_crop).save(preprocess_dir / "face_mask.png")
 
-    print(f"\n  Preprocessing intermediates saved to: {preprocess_dir}/")
+    logger.info("Preprocessing intermediates saved to: %s/", preprocess_dir)
 
     if data.face_img is None:
-        print("\n  [ERROR] No face crop produced — check that a face is visible in the image.")
-        print("          Also verify BiSeNet model is at models/bisenet/bisenet_face_parsing.pth")
+        logger.error(
+            "No face crop produced — check that a face is visible in the image. "
+            "Also verify BiSeNet model is at models/bisenet/bisenet_face_parsing.pth"
+        )
         sys.exit(1)
 
     # ── Generate ───────────────────────────────────────────────────────────
-    print("\n[STEP 2/2] Generating face sketch...")
+    logger.info("[STEP 2/2] Generating face sketch...")
     result = generate_fru_sketch_in_memory(data)
 
     sketch_path = OUTPUT_DIR / f"{person_id}_fru_final_sketch.jpg"
     result.final_sketch.save(sketch_path, quality=95)
-    print(f"\n  Final sketch saved : {sketch_path}")
+    logger.info("Final sketch saved : %s", sketch_path)
 
     if result.scene_images:
         for i, scene_img in enumerate(result.scene_images):
             scene_path = OUTPUT_DIR / f"{person_id}_fru_scene_{i:03d}.jpg"
             scene_img.save(scene_path, quality=95)
-        print(f"  Scenes saved       : {len(result.scene_images)} image(s)")
+        logger.info("Scenes saved       : %d image(s)", len(result.scene_images))
     else:
-        print("  No scenes (check inputs/scenes/face_bg/ and crops-face-meta.json)")
+        logger.info("No scenes (check inputs/scenes/face_bg/ and crops-face-meta.json)")
 
 
 # ============================================================================
@@ -187,11 +209,10 @@ if __name__ == "__main__":
         else:
             run_sau(args.image, args.id, args.gender)
 
-        print(f"\n{'='*60}")
-        print(f"Done. All outputs in: {OUTPUT_DIR}/")
-        print(f"{'='*60}\n")
+        logger.info("=" * 60)
+        logger.info("Done. All outputs in: %s/", OUTPUT_DIR)
+        logger.info("=" * 60)
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.error("Pipeline failed with an unhandled exception", exc_info=True)
         sys.exit(1)

@@ -3,6 +3,7 @@ Portrait Sketch Preprocessing Pipeline - Memory-Only
 All processing runs in RAM. No files written to disk.
 """
 
+import logging
 import os
 import sys
 
@@ -13,6 +14,8 @@ from PIL import Image, ImageEnhance, ImageFilter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
 # -- TF32 optimisation (no xformers) ------------------------------------------
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -21,7 +24,7 @@ if torch.cuda.is_available():
 # -- Optional heavy dependencies -----------------------------------------------
 try:
     from controlnet_aux import LineartDetector, HEDdetector
-except Exception:
+except Exception:                           # ImportError or missing native libs
     LineartDetector = None
     HEDdetector = None
 
@@ -84,7 +87,7 @@ def _get_torch_device() -> str:
 def _init_rembg():
     global _REMBG_SESSION
     if _REMBG_SESSION is None and REMBG_AVAILABLE:
-        print("[INFO] Initializing RemBG session...")
+        logger.info("Initializing RemBG session...")
         try:
             _REMBG_SESSION = new_session("u2net")
         except Exception:
@@ -162,8 +165,8 @@ def _enhance_local_contrast(img: Image.Image) -> Image.Image:
         else:
             enhanced = clahe.apply(img_cv)
         return Image.fromarray(enhanced)
-    except Exception as e:
-        print(f"[WARN] Local contrast enhancement failed: {e}")
+    except cv2.error as e:
+        logger.warning("Local contrast enhancement failed", exc_info=True)
         return img
 
 
@@ -209,8 +212,8 @@ def _detect_all_faces(img: Image.Image) -> List[Dict]:
             })
         faces.sort(key=lambda x: x["confidence"], reverse=True)
         return faces
-    except Exception as e:
-        print(f"[ERROR] Face detection failed: {e}")
+    except RuntimeError:
+        logger.error("Face detection failed", exc_info=True)
         return []
 
 
@@ -260,8 +263,8 @@ def _detect_gender(img: Image.Image, face_box: Optional[Tuple] = None) -> str:
             best_face = faces[0]
 
         return "male" if best_face.gender == 1 else "female"
-    except Exception as e:
-        print(f"[WARN] Gender detection failed: {e}")
+    except Exception:
+        logger.warning("Gender detection failed", exc_info=True)
         return "unknown"
 
 
@@ -303,8 +306,8 @@ def _extract_face_embedding(img: Image.Image, face_box: Tuple) -> Optional[np.nd
                           + ((f.bbox[1] + f.bbox[3]) / 2 - cy) ** 2,
         )
         return best_face.normed_embedding
-    except Exception as e:
-        print(f"[ERROR] Embedding extraction failed: {e}")
+    except Exception:
+        logger.error("Embedding extraction failed", exc_info=True)
         return None
 
 
@@ -350,24 +353,32 @@ def _make_edges_enhanced(img: Image.Image, preserve_details: bool = True) -> Ima
         try:
             if _MODEL_CACHE["edge_detector"] is None:
                 _MODEL_CACHE["edge_detector"] = LineartDetector.from_pretrained(
-                    MODEL_PATHS["annotators_lineart"]
+                    MODEL_PATHS["annotators_lineart"],
+                    local_files_only=True,   # Task 1
                 )
             det = _MODEL_CACHE["edge_detector"]
             result = det(img, coarse=not preserve_details)
             if result is not None:
                 result = ImageEnhance.Contrast(result).enhance(1.2)
                 return result.convert("RGB")
-        except Exception:
-            pass
+        except (FileNotFoundError, RuntimeError):
+            logger.warning(
+                "LineartDetector failed, trying HED fallback", exc_info=True
+            )
 
     if HEDdetector:
         try:
-            det = HEDdetector.from_pretrained(MODEL_PATHS["annotators_hed"])
+            det = HEDdetector.from_pretrained(
+                MODEL_PATHS["annotators_hed"],
+                local_files_only=True,       # Task 1
+            )
             result = det(img)
             if result is not None:
                 return result.convert("RGB")
-        except Exception:
-            pass
+        except (FileNotFoundError, RuntimeError):
+            logger.warning(
+                "HEDdetector failed, falling back to Canny", exc_info=True
+            )
 
     # Canny fallback
     arr = np.array(img)
@@ -504,13 +515,15 @@ def preprocess_image_in_memory(
     override = gender_override.strip().lower() if gender_override else None
     if override in ("male", "female"):
         gender = override
-        print(f"  [INFO] Gender from JSON override: {gender}")
+        logger.info("Gender from JSON override: %s", gender)
     elif primary_face:
         gender = _detect_gender(cropped_rgba, primary_face["box"])
-        print(f"  [INFO] Gender from detection: {gender}")
+        logger.info("Gender from detection: %s", gender)
     else:
         gender = "unknown"
-        print("  [WARN] Gender unknown - no face detected and no JSON override provided")
+        logger.warning(
+            "Gender unknown — no face detected and no JSON override provided"
+        )
 
     # 5. Face enhancement - uniform sharpening, no gender/beard variants
     enhanced = img_corrected.copy()
@@ -522,7 +535,7 @@ def preprocess_image_in_memory(
     if primary_face and INSIGHTFACE_AVAILABLE:
         faceid_embedding = _extract_face_embedding(cropped_rgba, primary_face["box"])
         if faceid_embedding is not None:
-            print(f"  [INFO] Face embedding extracted: shape {faceid_embedding.shape}")
+            logger.info("Face embedding extracted: shape %s", faceid_embedding.shape)
 
     # 7. Parallel edge map generation (body + face)
     def process_body_edges():

@@ -5,6 +5,7 @@ Returns List[PIL.Image] of scene-composed images.
 """
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -43,6 +44,8 @@ from config import (
 )
 from pipeline.preprocessor import PreprocessedData
 
+logger = logging.getLogger(__name__)
+
 # -- TF32 optimisation (no xformers) ------------------------------------------
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -63,12 +66,12 @@ _REMBG_SESSION = None
 
 def _get_optimal_device() -> Tuple[str, torch.dtype]:
     if torch.backends.mps.is_available():
-        print("[INFO] Using MPS (Apple Silicon)")
+        logger.info("Using MPS (Apple Silicon)")
         return "mps", torch.float32
     if torch.cuda.is_available():
-        print("[INFO] Using CUDA")
+        logger.info("Using CUDA")
         return "cuda", torch.float16
-    print("[INFO] Using CPU (slow)")
+    logger.info("Using CPU (slow)")
     return "cpu", torch.float32
 
 
@@ -192,7 +195,7 @@ def _blend_face_sketch(fullbody: Image.Image, face_sketch: Image.Image,
 
 def _verify_local_models():
     missing = [
-        f"  [ERROR] {n}: {MODEL_PATHS[n]}"
+        f"  {n}: {MODEL_PATHS[n]}"
         for n in ["sd15", "controlnet"]
         if not Path(MODEL_PATHS[n]).exists()
     ]
@@ -206,68 +209,96 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
     Loads and caches the SD pipeline.
     Returns (pipe, lora_loaded: bool).
     """
-    # FIX #1: removed the erroneous _MODEL_CACHE["pipeline"] = None line
-    # that was forcing a full reload on every call.
     config_key = f"{device}_{dtype}_{load_lora}_{lora_scale}_{use_lcm}"
     if (_MODEL_CACHE["pipeline"] is not None
             and _MODEL_CACHE["pipeline_config"] == config_key):
-        print("[INFO] Using cached pipeline")
+        logger.info("Using cached pipeline")
         return _MODEL_CACHE["pipeline"], _MODEL_CACHE["lora_loaded"]
 
     _verify_local_models()
 
+    # Task 1: local_files_only=True on all from_pretrained / from_config calls
     controlnet = ControlNetModel.from_pretrained(
-        MODEL_PATHS["controlnet"], torch_dtype=dtype
+        MODEL_PATHS["controlnet"],
+        torch_dtype=dtype,
+        local_files_only=True,
     )
 
     if device == "mps":
         pipe = StableDiffusionControlNetPipeline.from_pretrained(
-            MODEL_PATHS["sd15"], controlnet=controlnet, torch_dtype=dtype,
-            safety_checker=None, use_safetensors=True,
+            MODEL_PATHS["sd15"],
+            controlnet=controlnet,
+            torch_dtype=dtype,
+            safety_checker=None,
+            use_safetensors=True,
+            local_files_only=True,
         )
     else:
         pipe = StableDiffusionControlNetPipeline.from_pretrained(
-            MODEL_PATHS["sd15"], controlnet=controlnet, torch_dtype=dtype,
+            MODEL_PATHS["sd15"],
+            controlnet=controlnet,
+            torch_dtype=dtype,
             safety_checker=None,
             variant="fp16" if device == "cuda" else None,
             use_safetensors=True,
+            local_files_only=True,
         )
 
     # -- TAESD (tiny VAE for fast LCM decoding) --------------------------------
     if use_lcm:
         try:
             pipe.vae = AutoencoderTiny.from_pretrained(
-                MODEL_PATHS["taesd"], torch_dtype=dtype
+                MODEL_PATHS["taesd"],
+                torch_dtype=dtype,
+                local_files_only=True,   # Task 1: prevent download if file missing
             )
-            print("[INFO] TAESD loaded")
-        except Exception as e:
-            print(f"[WARN] TAESD loading failed: {e}")
+            logger.info("TAESD loaded")
+        except (FileNotFoundError, OSError, RuntimeError):
+            logger.warning(
+                "TAESD loading failed — falling back to default VAE", exc_info=True
+            )
 
-    # -- LoRA loading ----------------------------------------------------------
+    # -- LoRA loading (Task 2: PEFT adapter method, replaces deprecated fuse_lora) --
     lora_loaded = False
     if use_lcm:
         lcm_path = MODEL_PATHS["lcm_lora"]
-        pipe.load_lora_weights(lcm_path, weight_name="pytorch_lora_weights.safetensors")
-        pipe.fuse_lora(lora_scale=1.0)
-        print("[INFO] LCM LoRA loaded and fused")
+        pipe.load_lora_weights(
+            lcm_path,
+            weight_name="pytorch_lora_weights.safetensors",
+            adapter_name="lcm",
+        )
+        logger.info("LCM LoRA loaded as PEFT adapter 'lcm'")
+
+        active_adapters: List[str] = ["lcm"]
+        adapter_weights: List[float] = [1.0]
 
         if load_lora and Path(MODEL_PATHS["lora"]).exists():
             pipe.load_lora_weights(
                 MODEL_PATHS["lora"],
                 weight_name="Pencil_Sketch_by_vizsumit.safetensors",
+                adapter_name="style",
             )
-            pipe.fuse_lora(lora_scale=lora_scale * 1.3)
+            active_adapters.append("style")
+            adapter_weights.append(lora_scale * 1.3)
             lora_loaded = True
-            print("[INFO] Style LoRA loaded and fused")
+            logger.info("Style LoRA loaded as PEFT adapter 'style'")
 
-        pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-        print("[INFO] LCM Scheduler activated")
+        pipe.set_adapters(active_adapters, adapter_weights=adapter_weights)
+        logger.info(
+            "Active adapters: %s with weights %s", active_adapters, adapter_weights
+        )
+
+        pipe.scheduler = LCMScheduler.from_config(
+            pipe.scheduler.config,
+            local_files_only=True,   # Task 1
+        )
+        logger.info("LCM Scheduler activated")
 
     pipe = pipe.to(device)
 
     if device == "mps":
         pipe.enable_attention_slicing()
-        print("[INFO] MPS attention slicing enabled")
+        logger.info("MPS attention slicing enabled")
 
     _MODEL_CACHE["pipeline"]        = pipe
     _MODEL_CACHE["pipeline_config"] = config_key
@@ -283,8 +314,8 @@ def _load_ip_adapter(pipe, device: str, dtype: torch.dtype):
         return IPAdapterFaceID(
             pipe, MODEL_PATHS["ip_adapter"], device, num_tokens=4, torch_dtype=dtype
         )
-    except Exception as e:
-        print(f"[WARN] IP-Adapter loading failed: {e}")
+    except (FileNotFoundError, OSError, RuntimeError):
+        logger.warning("IP-Adapter loading failed", exc_info=True)
         return None
 
 
@@ -398,7 +429,7 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
     Returns a list of PIL Images - no files saved.
     """
     if not SCENES_DIR.exists():
-        print(f"[INFO] No scenes directory at {SCENES_DIR}, skipping composition.")
+        logger.info("No scenes directory at %s, skipping composition.", SCENES_DIR)
         return []
 
     crops_data: Dict = {}
@@ -409,7 +440,7 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
             break
 
     if not crops_data:
-        print("[WARN] crops.json not found, skipping scene composition.")
+        logger.warning("crops.json not found, skipping scene composition.")
         return []
 
     sketch_transparent = _remove_sketch_background(final_sketch)
@@ -425,8 +456,8 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
                 return _compose_single_scene(
                     sketch_transparent, scene_file, crops_data[scene_id][0]
                 )
-            except Exception as e:
-                print(f"  [WARN] Scene {scene_id} failed: {e}")
+            except (OSError, ValueError):
+                logger.warning("Scene %s failed", scene_id, exc_info=True)
         return None
 
     results: List[Image.Image] = []
@@ -437,7 +468,7 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
             if img is not None:
                 results.append(img)
 
-    print(f"  [INFO] {len(results)} scene(s) composed")
+    logger.info("%d scene(s) composed", len(results))
     return results
 
 
@@ -463,7 +494,7 @@ def _generate_single_sketch(
 
     prompt   = _build_prompt(gender, use_lora, is_lcm)
     negative = _build_negative(gender, is_lcm)
-    print(f"  [sketch] gender={gender} | {prompt[:80]}...")
+    logger.info("Sketch generation — gender=%s | %s...", gender, prompt[:80])
 
     generator = torch.Generator(
         device="cpu" if device == "mps" else device
@@ -491,8 +522,10 @@ def _generate_single_sketch(
                 height=controlnet_img.height,
             )
             return images[0]
-        except Exception as e:
-            print(f"[WARN] IP-Adapter failed, falling back to base pipe: {e}")
+        except RuntimeError:
+            logger.warning(
+                "IP-Adapter generation failed, falling back to base pipe", exc_info=True
+            )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -561,7 +594,7 @@ def generate_sketch_in_memory(
     )
     ip_adapter = _load_ip_adapter(pipe, device, dtype) if faceid_embeds is not None else None
 
-    print(f"\n[INFO] Generating body sketch (gender={data.gender})...")
+    logger.info("Generating body sketch (gender=%s)...", data.gender)
     body_sketch = _generate_single_sketch(
         data.enhanced, pipe, ip_adapter, data.body_edges,
         faceid_embeds, faceid_strength, device, dtype,
@@ -573,7 +606,7 @@ def generate_sketch_in_memory(
 
     face_sketch: Optional[Image.Image] = None
     if data.primary_face and data.face_img is not None and data.face_edges is not None:
-        print(f"[INFO] Generating face sketch (gender={data.gender})...")
+        logger.info("Generating face sketch (gender=%s)...", data.gender)
         face_sketch = _generate_single_sketch(
             data.face_img, pipe, ip_adapter, data.face_edges,
             faceid_embeds, faceid_strength, device, dtype,
@@ -595,7 +628,7 @@ def generate_sketch_in_memory(
     if REMBG_AVAILABLE:
         scene_images = run_scene_composition_in_memory(final_sketch)
     else:
-        print("[WARN] rembg not available, skipping scene composition")
+        logger.warning("rembg not available, skipping scene composition")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
