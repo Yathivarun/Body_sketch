@@ -182,23 +182,51 @@ def _post_process_sketch(img: Image.Image, sharpness: float = 2.0,
 # FACE BLENDING
 # ============================================================================
 
-def _blend_face_sketch(fullbody: Image.Image, face_sketch: Image.Image,
-                       face_crop_box: Tuple, blend_margin: int = 20) -> Image.Image:
+def _blend_face_sketch(
+    fullbody: Image.Image,
+    face_sketch: Image.Image,
+    face_crop_box: Tuple,
+    semantic_mask: Optional[Image.Image] = None,
+    blend_margin: int = 20,
+) -> Image.Image:
     cx1, cy1, cx2, cy2 = face_crop_box
-    face_resized = face_sketch.resize((cx2 - cx1, cy2 - cy1), Image.LANCZOS)
+    target_w, target_h = cx2 - cx1, cy2 - cy1
+    face_resized = face_sketch.resize((target_w, target_h), Image.LANCZOS)
     result = fullbody.copy()
-    mask = np.ones((face_resized.height, face_resized.width), dtype=float) * 255
-    for i in range(blend_margin):
-        alpha = i / blend_margin
-        if i < mask.shape[0]:
-            mask[i, :] *= alpha
-        if mask.shape[0] - i - 1 >= 0:
-            mask[mask.shape[0] - i - 1, :] *= alpha
-        if i < mask.shape[1]:
-            mask[:, i] *= alpha
-        if mask.shape[1] - i - 1 >= 0:
-            mask[:, mask.shape[1] - i - 1] *= alpha
-    result.paste(face_resized, (cx1, cy1), Image.fromarray(mask.astype(np.uint8)))
+
+    if semantic_mask is not None:
+        # -- Semantic path: BiSeNet mask drives the blend boundary ----------
+        # Resize mask to match the pasted face region.
+        mask_resized = semantic_mask.resize((target_w, target_h), Image.NEAREST)
+        mask_arr = np.array(mask_resized, dtype=np.uint8)   # values: 0 or 255
+
+        # Erode inward so the mask boundary sits slightly inside the face
+        # geometry, preventing any overhang of face pixels at the neckline.
+        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_arr = cv2.erode(mask_arr, erode_kernel, iterations=2)
+
+        # Heavy Gaussian blur creates a wide feathered gradient so the paste
+        # fades smoothly into the body sketch at the jaw/neck/hair boundary.
+        mask_arr = cv2.GaussianBlur(mask_arr, (41, 41), 0)
+
+        blend_mask = Image.fromarray(mask_arr, mode="L")
+
+    else:
+        # -- Fallback path: square linear gradient at each edge --------------
+        mask = np.ones((target_h, target_w), dtype=float) * 255
+        for i in range(blend_margin):
+            alpha = i / blend_margin
+            if i < mask.shape[0]:
+                mask[i, :] *= alpha
+            if mask.shape[0] - i - 1 >= 0:
+                mask[mask.shape[0] - i - 1, :] *= alpha
+            if i < mask.shape[1]:
+                mask[:, i] *= alpha
+            if mask.shape[1] - i - 1 >= 0:
+                mask[:, mask.shape[1] - i - 1] *= alpha
+        blend_mask = Image.fromarray(mask.astype(np.uint8))
+
+    result.paste(face_resized, (cx1, cy1), blend_mask)
     return result
 
 
@@ -651,8 +679,11 @@ def generate_sketch_in_memory(
             seed=5678, use_lora=lora_loaded,
             gender=data.gender, use_lcm=use_lcm,
         )
+        semantic_face_mask = getattr(data, "semantic_face_mask", None)
         final_sketch = _blend_face_sketch(
-            body_sketch, face_sketch, data.face_crop_box, blend_margin=30
+            body_sketch, face_sketch, data.face_crop_box,
+            semantic_mask=semantic_face_mask,
+            blend_margin=30,
         )
 
     final_sketch = _post_process_sketch(

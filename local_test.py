@@ -79,6 +79,11 @@ def run_sau(image_path: str, person_id: str, gender: str):
         data.face_img.save(preprocess_dir / "face_cropped.jpg", quality=95)
     if data.face_edges is not None:
         data.face_edges.save(preprocess_dir / "face_edges.png")
+    if data.semantic_face_mask is not None:
+        data.semantic_face_mask.save(preprocess_dir / "semantic_face_mask.png")
+        logger.info("BiSeNet mask saved  : %s", preprocess_dir / "semantic_face_mask.png")
+    else:
+        logger.warning("BiSeNet mask        : not available (blending will use fallback)")
     logger.info("Preprocessing intermediates saved to: %s/", preprocess_dir)
 
     # ── Generate ───────────────────────────────────────────────────────────

@@ -57,6 +57,7 @@ _MODEL_CACHE: Dict = {
     "insightface_app": None,
     "edge_detector":   None,
     "mtcnn":           None,
+    "bisenet":         None,
 }
 _REMBG_SESSION = None
 
@@ -432,6 +433,325 @@ def _crop_face_with_padding(img: Image.Image,
 
 
 # ============================================================================
+# BISENET FACE PARSING — self-contained architecture + inference
+#
+# Exact port of zllrunning/face-parsing.PyTorch (model.py + resnet.py).
+# State-dict keys match the official checkpoint verbatim so load_state_dict
+# works with strict=True and zero missing/unexpected keys.
+# No external repo or pip package is required.
+# ============================================================================
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# ResNet-18 backbone  (mirrors resnet.py from the official repo exactly)
+# Key paths in checkpoint: cp.resnet.conv1, cp.resnet.bn1,
+#   cp.resnet.layer1-4, cp.resnet.layer{N}.{i}.conv1/bn1/conv2/bn2/downsample
+# ---------------------------------------------------------------------------
+
+def _conv3x3(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3,
+                     stride=stride, padding=1, bias=False)
+
+
+class _BasicBlock(nn.Module):
+    def __init__(self, in_chan: int, out_chan: int, stride: int = 1) -> None:
+        super().__init__()
+        self.conv1 = _conv3x3(in_chan, out_chan, stride)
+        self.bn1   = nn.BatchNorm2d(out_chan)
+        self.conv2 = _conv3x3(out_chan, out_chan)
+        self.bn2   = nn.BatchNorm2d(out_chan)
+        self.relu  = nn.ReLU(inplace=True)
+        self.downsample = None
+        if in_chan != out_chan or stride != 1:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_chan, out_chan, kernel_size=1,
+                          stride=stride, bias=False),
+                nn.BatchNorm2d(out_chan),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.conv1(x)
+        residual = F.relu(self.bn1(residual))
+        residual = self.conv2(residual)
+        residual = self.bn2(residual)
+        shortcut = self.downsample(x) if self.downsample is not None else x
+        return self.relu(shortcut + residual)
+
+
+def _make_layer(in_chan: int, out_chan: int, bnum: int,
+                stride: int = 1) -> nn.Sequential:
+    layers = [_BasicBlock(in_chan, out_chan, stride=stride)]
+    for _ in range(bnum - 1):
+        layers.append(_BasicBlock(out_chan, out_chan, stride=1))
+    return nn.Sequential(*layers)
+
+
+class _Resnet18(nn.Module):
+    """
+    Custom ResNet-18 matching resnet.py exactly.
+    Returns (feat8, feat16, feat32) — 1/8, 1/16, 1/32 of input resolution.
+    State-dict keys: conv1, bn1, layer1, layer2, layer3, layer4  (no 'fc').
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1   = nn.Conv2d(3, 64, kernel_size=7, stride=2,
+                                 padding=3, bias=False)
+        self.bn1     = nn.BatchNorm2d(64)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1  = _make_layer(64,  64,  bnum=2, stride=1)
+        self.layer2  = _make_layer(64,  128, bnum=2, stride=2)   # → feat8
+        self.layer3  = _make_layer(128, 256, bnum=2, stride=2)   # → feat16
+        self.layer4  = _make_layer(256, 512, bnum=2, stride=2)   # → feat32
+
+    def forward(self, x: torch.Tensor):
+        x       = self.maxpool(F.relu(self.bn1(self.conv1(x))))
+        x       = self.layer1(x)
+        feat8   = self.layer2(x)
+        feat16  = self.layer3(feat8)
+        feat32  = self.layer4(feat16)
+        return feat8, feat16, feat32
+
+
+# ---------------------------------------------------------------------------
+# BiSeNet building blocks  (mirrors model.py from the official repo exactly)
+# ---------------------------------------------------------------------------
+
+class _ConvBNReLU(nn.Module):
+    def __init__(self, in_chan: int, out_chan: int,
+                 ks: int = 3, stride: int = 1, padding: int = 1) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(in_chan, out_chan, kernel_size=ks,
+                              stride=stride, padding=padding, bias=False)
+        self.bn   = nn.BatchNorm2d(out_chan)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.bn(self.conv(x)))
+
+
+class _BiSeNetOutput(nn.Module):
+    """Segmentation head — keys: conv.conv/bn, conv_out."""
+    def __init__(self, in_chan: int, mid_chan: int, n_classes: int) -> None:
+        super().__init__()
+        self.conv     = _ConvBNReLU(in_chan, mid_chan, ks=3, stride=1, padding=1)
+        self.conv_out = nn.Conv2d(mid_chan, n_classes, kernel_size=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv_out(self.conv(x))
+
+
+class _AttentionRefinementModule(nn.Module):
+    """ARM — keys: conv.conv/bn, conv_atten, bn_atten."""
+    def __init__(self, in_chan: int, out_chan: int) -> None:
+        super().__init__()
+        self.conv        = _ConvBNReLU(in_chan, out_chan, ks=3, stride=1, padding=1)
+        self.conv_atten  = nn.Conv2d(out_chan, out_chan, kernel_size=1, bias=False)
+        self.bn_atten    = nn.BatchNorm2d(out_chan)
+        self.sigmoid_atten = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat  = self.conv(x)
+        atten = self.sigmoid_atten(
+            self.bn_atten(self.conv_atten(F.avg_pool2d(feat, feat.size()[2:])))
+        )
+        return torch.mul(feat, atten)
+
+
+class _ContextPath(nn.Module):
+    """
+    Context Path — keys: resnet.*, arm16.*, arm32.*,
+                         conv_head32.*, conv_head16.*, conv_avg.*
+    Returns (feat8, feat_cp8, feat_cp16)  — all at 1/8 resolution.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self.resnet      = _Resnet18()
+        self.arm16       = _AttentionRefinementModule(256, 128)
+        self.arm32       = _AttentionRefinementModule(512, 128)
+        self.conv_head32 = _ConvBNReLU(128, 128, ks=3, stride=1, padding=1)
+        self.conv_head16 = _ConvBNReLU(128, 128, ks=3, stride=1, padding=1)
+        self.conv_avg    = _ConvBNReLU(512, 128, ks=1, stride=1, padding=0)
+
+    def forward(self, x: torch.Tensor):
+        feat8, feat16, feat32 = self.resnet(x)
+        H8,  W8  = feat8.size()[2:]
+        H16, W16 = feat16.size()[2:]
+        H32, W32 = feat32.size()[2:]
+
+        avg       = self.conv_avg(F.avg_pool2d(feat32, feat32.size()[2:]))
+        avg_up    = F.interpolate(avg, (H32, W32), mode='nearest')
+
+        feat32_arm = self.arm32(feat32)
+        feat32_sum = feat32_arm + avg_up
+        feat32_up  = self.conv_head32(
+            F.interpolate(feat32_sum, (H16, W16), mode='nearest'))
+
+        feat16_arm = self.arm16(feat16)
+        feat16_sum = feat16_arm + feat32_up
+        feat16_up  = self.conv_head16(
+            F.interpolate(feat16_sum, (H8, W8), mode='nearest'))
+
+        return feat8, feat16_up, feat32_up   # x8, x8, x16
+
+
+class _FeatureFusionModule(nn.Module):
+    """
+    FFM — keys: convblk.conv/bn, conv1, conv2.
+    in_chan = 256 (feat_res8 128ch + feat_cp8 128ch), out_chan = 256.
+    """
+    def __init__(self, in_chan: int, out_chan: int) -> None:
+        super().__init__()
+        self.convblk = _ConvBNReLU(in_chan, out_chan, ks=1, stride=1, padding=0)
+        self.conv1   = nn.Conv2d(out_chan, out_chan // 4,
+                                 kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv2   = nn.Conv2d(out_chan // 4, out_chan,
+                                 kernel_size=1, stride=1, padding=0, bias=False)
+        self.relu    = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, fsp: torch.Tensor, fcp: torch.Tensor) -> torch.Tensor:
+        feat       = self.convblk(torch.cat([fsp, fcp], dim=1))
+        atten      = self.sigmoid(self.conv2(self.relu(
+            self.conv1(F.avg_pool2d(feat, feat.size()[2:])))))
+        return torch.mul(feat, atten) + feat
+
+
+class _BiSeNet(nn.Module):
+    """
+    BiSeNet V1 — exact port of zllrunning/face-parsing.PyTorch model.py.
+
+    State-dict top-level keys: cp.*, ffm.*, conv_out.*, conv_out16.*, conv_out32.*
+    NOTE: there is NO 'sp' key — the spatial path was replaced by feat_res8
+    from the ResNet backbone (see comment in official repo forward()).
+    """
+    def __init__(self, n_classes: int = 19) -> None:
+        super().__init__()
+        self.cp        = _ContextPath()
+        # sp is intentionally absent — feat_res8 acts as the spatial path
+        self.ffm       = _FeatureFusionModule(256, 256)
+        self.conv_out  = _BiSeNetOutput(256, 256, n_classes)
+        self.conv_out16 = _BiSeNetOutput(128, 64, n_classes)
+        self.conv_out32 = _BiSeNetOutput(128, 64, n_classes)
+
+    def forward(self, x: torch.Tensor):
+        H, W = x.size()[2:]
+        feat_res8, feat_cp8, feat_cp16 = self.cp(x)
+        feat_sp   = feat_res8                          # reuse resnet feat8 as SP
+        feat_fuse = self.ffm(feat_sp, feat_cp8)
+
+        feat_out   = F.interpolate(self.conv_out(feat_fuse),
+                                   (H, W), mode='bilinear', align_corners=True)
+        feat_out16 = F.interpolate(self.conv_out16(feat_cp8),
+                                   (H, W), mode='bilinear', align_corners=True)
+        feat_out32 = F.interpolate(self.conv_out32(feat_cp16),
+                                   (H, W), mode='bilinear', align_corners=True)
+        return feat_out, feat_out16, feat_out32
+
+
+# -- Class IDs to keep in the binary blend mask --------------------------------
+# Facial features: 1-13, neck: 14, hair: 17.
+# Strictly excluded: 0 (background), 16 (clothing).
+_BISENET_FACE_IDS = frozenset([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17])
+
+_BISENET_MEAN = [0.485, 0.456, 0.406]
+_BISENET_STD  = [0.229, 0.224, 0.225]
+
+
+def _get_bisenet_mask(face_img: Image.Image) -> Optional[Image.Image]:
+    """
+    Run BiSeNet face-parsing on *face_img* and return a binary PIL mask (mode "L").
+
+    Pixels belonging to facial features (class IDs 1-13), neck (14), or hair
+    (17) are set to 255; all other pixels (including background=0 and
+    clothing=16) are set to 0.
+
+    Args:
+        face_img: RGB PIL Image of the face crop (any size).
+
+    Returns:
+        PIL Image (mode "L") at the same size as *face_img*, or None on error.
+    """
+    try:
+        if _MODEL_CACHE["bisenet"] is None:
+            logger.info("Loading BiSeNet model from %s", MODEL_PATHS["bisenet"])
+
+            raw = torch.load(
+                MODEL_PATHS["bisenet"],
+                map_location=_get_torch_device(),
+                weights_only=False,
+            )
+
+            if isinstance(raw, torch.nn.Module):
+                # Checkpoint was saved with torch.save(model, path) — use directly.
+                model = raw
+                logger.info("BiSeNet loaded as serialised nn.Module")
+            else:
+                # Checkpoint is a plain state dict (the standard case for
+                # zllrunning/face-parsing.PyTorch checkpoints saved via
+                # torch.save(model.state_dict(), path)).
+                # Instantiate the architecture that lives in this file and
+                # load the weights — no external repo or pip package needed.
+                model = _BiSeNet(n_classes=19)
+                # Strip DataParallel 'module.' prefix when present.
+                state = {k.replace("module.", ""): v for k, v in raw.items()}
+                missing, unexpected = model.load_state_dict(state, strict=True)
+                logger.info("BiSeNet state dict loaded — all keys matched")
+
+            model.to(_get_torch_device())
+            model.eval()
+            _MODEL_CACHE["bisenet"] = model
+            logger.info("BiSeNet model ready and cached on %s", _get_torch_device())
+        model = _MODEL_CACHE["bisenet"]
+
+    except Exception:
+        logger.error("Failed to load BiSeNet model", exc_info=True)
+        return None
+
+    try:
+        original_size = face_img.size          # (W, H) — needed for resize-back
+        device = _get_torch_device()
+
+        # -- Preprocess: resize → float tensor → normalise → add batch dim ----
+        resized = face_img.convert("RGB").resize((512, 512), Image.BILINEAR)
+        arr = np.array(resized).astype(np.float32) / 255.0            # H×W×3
+
+        mean = np.array(_BISENET_MEAN, dtype=np.float32)
+        std  = np.array(_BISENET_STD,  dtype=np.float32)
+        arr  = (arr - mean) / std
+
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # 1×3×512×512
+        tensor = tensor.to(device)
+
+        # -- Inference: out_main is the primary logit map (index 0) -----------
+        with torch.no_grad():
+            out_main = model(tensor)[0]                                # 1×19×512×512
+
+        class_ids = out_main.squeeze(0).argmax(dim=0).cpu().numpy()   # 512×512 int64
+
+        # -- Build binary mask: 255 for face/hair/neck, 0 everywhere else -----
+        mask_arr = np.zeros(class_ids.shape, dtype=np.uint8)
+        for cls_id in _BISENET_FACE_IDS:
+            mask_arr[class_ids == cls_id] = 255
+
+        # -- Resize mask back to original face crop dimensions ----------------
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        mask_img = mask_img.resize(original_size, Image.NEAREST)
+
+        logger.info(
+            "BiSeNet mask generated: size=%s, face coverage=%.1f%%",
+            mask_img.size,
+            float(np.mean(mask_arr > 0)) * 100,
+        )
+        return mask_img
+
+    except Exception:
+        logger.error("BiSeNet inference failed", exc_info=True)
+        return None
+
+
+# ============================================================================
 # SEGMENTATION
 # ============================================================================
 
@@ -501,21 +821,56 @@ class PreprocessedData:
         face_crop_box: Optional[Tuple],
         original_size: Tuple[int, int],
         crop_info: Dict,
+        semantic_face_mask: Optional[Image.Image] = None,
     ):
-        self.enhanced         = enhanced
-        self.body_edges       = body_edges
-        self.face_img         = face_img
-        self.face_edges       = face_edges
-        self.faceid_embedding = faceid_embedding
-        self.gender           = gender
-        self.primary_face     = primary_face
-        self.face_crop_box    = face_crop_box
-        self.original_size    = original_size
-        self.crop_info        = crop_info
+        self.enhanced           = enhanced
+        self.body_edges         = body_edges
+        self.face_img           = face_img
+        self.face_edges         = face_edges
+        self.faceid_embedding   = faceid_embedding
+        self.gender             = gender
+        self.primary_face       = primary_face
+        self.face_crop_box      = face_crop_box
+        self.original_size      = original_size
+        self.crop_info          = crop_info
+        self.semantic_face_mask = semantic_face_mask
 
     @property
     def has_face_embedding(self) -> bool:
         return self.faceid_embedding is not None
+
+    def save_intermediates(self, out_dir: str) -> None:
+        """
+        Save every visual artifact to *out_dir* for debugging / inspection.
+
+        Files written (only when the artifact is not None):
+            enhanced.jpg            — SD-stream full-body image
+            body_edges.jpg          — full-body lineart / Canny edge map
+            face_img.jpg            — SD-stream face crop
+            face_edges.jpg          — face edge map
+            semantic_face_mask.png  — BiSeNet binary mask (L-mode, lossless PNG)
+
+        The directory is created automatically if it does not exist.
+        """
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+
+        def _save(img: Optional[Image.Image], filename: str) -> None:
+            if img is None:
+                return
+            path = os.path.join(out_dir, filename)
+            # Force RGB for JPEG; keep PNG for mask (lossless, preserves L mode)
+            if filename.endswith(".jpg"):
+                img.convert("RGB").save(path, quality=95)
+            else:
+                img.save(path)
+            logger.info("Saved intermediate: %s", path)
+
+        _save(self.enhanced,           "enhanced.jpg")
+        _save(self.body_edges,         "body_edges.jpg")
+        _save(self.face_img,           "face_img.jpg")
+        _save(self.face_edges,         "face_edges.jpg")
+        _save(self.semantic_face_mask, "semantic_face_mask.png")
 
 
 # ============================================================================
@@ -608,7 +963,7 @@ def preprocess_image_in_memory(
 
     def process_face_data():
         if not primary_face:
-            return None, None, None
+            return None, None, None, None
         # Crop the face bounding box from img_for_edges (not from enhanced /
         # img_for_sd) so the lineart detector sees unbrightened edge contrast.
         f_img_edges, f_box = _crop_face_with_padding(img_for_edges, primary_face["box"])
@@ -626,13 +981,14 @@ def preprocess_image_in_memory(
                 (int(f_img_sd.width * s), int(f_img_sd.height * s)), Image.LANCZOS
             )
         f_edges = _make_edges_enhanced(f_img_edges, preserve_details=preserve_details)
-        return f_img_sd, f_edges, f_box
+        f_semantic_mask = _get_bisenet_mask(f_img_sd)
+        return f_img_sd, f_edges, f_box, f_semantic_mask
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_body = executor.submit(process_body_edges)
         future_face = executor.submit(process_face_data)
         body_edges = future_body.result()
-        face_img, face_edges, face_crop_box = future_face.result()
+        face_img, face_edges, face_crop_box, semantic_face_mask = future_face.result()
 
     return PreprocessedData(
         enhanced=enhanced,
@@ -645,4 +1001,5 @@ def preprocess_image_in_memory(
         face_crop_box=face_crop_box,
         original_size=current_size,
         crop_info=crop_info,
+        semantic_face_mask=semantic_face_mask,
     )
