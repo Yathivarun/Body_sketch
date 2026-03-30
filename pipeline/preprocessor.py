@@ -354,7 +354,6 @@ def _make_edges_enhanced(img: Image.Image, preserve_details: bool = True) -> Ima
             if _MODEL_CACHE["edge_detector"] is None:
                 _MODEL_CACHE["edge_detector"] = LineartDetector.from_pretrained(
                     MODEL_PATHS["annotators_lineart"],
-                    local_files_only=True,   # Task 1
                 )
             det = _MODEL_CACHE["edge_detector"]
             result = det(img, coarse=not preserve_details)
@@ -370,7 +369,6 @@ def _make_edges_enhanced(img: Image.Image, preserve_details: bool = True) -> Ima
         try:
             det = HEDdetector.from_pretrained(
                 MODEL_PATHS["annotators_hed"],
-                local_files_only=True,       # Task 1
             )
             result = det(img)
             if result is not None:

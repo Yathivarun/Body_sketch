@@ -31,6 +31,19 @@ except Exception:
     FACEID_AVAILABLE = False
 
 try:
+    # USE_PEFT_BACKEND is True only when diffusers has verified that peft is
+    # installed at a compatible version and has wired its LoRA loader to use the
+    # PEFT backend. A bare `import peft` check is insufficient: older diffusers
+    # builds keep the legacy monkey-patching path even when peft is present,
+    # causing set_adapters() to raise "PEFT backend is required".
+    from diffusers.utils import USE_PEFT_BACKEND as _USE_PEFT_BACKEND
+    PEFT_AVAILABLE = bool(_USE_PEFT_BACKEND)
+except ImportError:
+    # diffusers < 0.22 doesn't expose USE_PEFT_BACKEND; at that age fuse_lora()
+    # is always the right path anyway.
+    PEFT_AVAILABLE = False
+
+try:
     from rembg import remove, new_session
     REMBG_AVAILABLE = True
 except ImportError:
@@ -258,39 +271,64 @@ def _load_pipeline(device: str, dtype: torch.dtype, load_lora: bool = False,
                 "TAESD loading failed — falling back to default VAE", exc_info=True
             )
 
-    # -- LoRA loading (Task 2: PEFT adapter method, replaces deprecated fuse_lora) --
+
+    # -- LoRA loading: PEFT adapter method when available, legacy fuse_lora fallback --
     lora_loaded = False
     if use_lcm:
         lcm_path = MODEL_PATHS["lcm_lora"]
-        pipe.load_lora_weights(
-            lcm_path,
-            weight_name="pytorch_lora_weights.safetensors",
-            adapter_name="lcm",
-        )
-        logger.info("LCM LoRA loaded as PEFT adapter 'lcm'")
 
-        active_adapters: List[str] = ["lcm"]
-        adapter_weights: List[float] = [1.0]
-
-        if load_lora and Path(MODEL_PATHS["lora"]).exists():
+        if PEFT_AVAILABLE:
+            # Modern path: named adapters + set_adapters() (no fuse_lora)
             pipe.load_lora_weights(
-                MODEL_PATHS["lora"],
-                weight_name="Pencil_Sketch_by_vizsumit.safetensors",
-                adapter_name="style",
+                lcm_path,
+                weight_name="pytorch_lora_weights.safetensors",
+                adapter_name="lcm",
             )
-            active_adapters.append("style")
-            adapter_weights.append(lora_scale * 1.3)
-            lora_loaded = True
-            logger.info("Style LoRA loaded as PEFT adapter 'style'")
+            logger.info("LCM LoRA loaded as PEFT adapter 'lcm'")
 
-        pipe.set_adapters(active_adapters, adapter_weights=adapter_weights)
-        logger.info(
-            "Active adapters: %s with weights %s", active_adapters, adapter_weights
-        )
+            active_adapters: List[str] = ["lcm"]
+            adapter_weights: List[float] = [1.0]
+
+            if load_lora and Path(MODEL_PATHS["lora"]).exists():
+                pipe.load_lora_weights(
+                    MODEL_PATHS["lora"],
+                    weight_name="Pencil_Sketch_by_vizsumit.safetensors",
+                    adapter_name="style",
+                )
+                active_adapters.append("style")
+                adapter_weights.append(lora_scale * 1.3)
+                lora_loaded = True
+                logger.info("Style LoRA loaded as PEFT adapter 'style'")
+
+            pipe.set_adapters(active_adapters, adapter_weights=adapter_weights)
+            logger.info(
+                "Active adapters: %s  weights: %s", active_adapters, adapter_weights
+            )
+
+        else:
+            # Legacy path: fuse_lora() for diffusers installations without PEFT
+            logger.warning(
+                "peft package not found — using legacy fuse_lora() path. "
+                "Install peft to enable the modern adapter backend."
+            )
+            pipe.load_lora_weights(
+                lcm_path, weight_name="pytorch_lora_weights.safetensors"
+            )
+            pipe.fuse_lora(lora_scale=1.0)
+            logger.info("LCM LoRA loaded and fused (legacy)")
+
+            if load_lora and Path(MODEL_PATHS["lora"]).exists():
+                pipe.load_lora_weights(
+                    MODEL_PATHS["lora"],
+                    weight_name="Pencil_Sketch_by_vizsumit.safetensors",
+                )
+                pipe.fuse_lora(lora_scale=lora_scale * 1.3)
+                lora_loaded = True
+                logger.info("Style LoRA loaded and fused (legacy)")
 
         pipe.scheduler = LCMScheduler.from_config(
             pipe.scheduler.config,
-            local_files_only=True,   # Task 1
+            local_files_only=True,
         )
         logger.info("LCM Scheduler activated")
 
