@@ -822,6 +822,7 @@ class PreprocessedData:
         original_size: Tuple[int, int],
         crop_info: Dict,
         semantic_face_mask: Optional[Image.Image] = None,
+        original_alpha: Optional[Image.Image] = None,
     ):
         self.enhanced           = enhanced
         self.body_edges         = body_edges
@@ -834,6 +835,7 @@ class PreprocessedData:
         self.original_size      = original_size
         self.crop_info          = crop_info
         self.semantic_face_mask = semantic_face_mask
+        self.original_alpha     = original_alpha
 
     @property
     def has_face_embedding(self) -> bool:
@@ -871,6 +873,7 @@ class PreprocessedData:
         _save(self.face_img,           "face_img.jpg")
         _save(self.face_edges,         "face_edges.jpg")
         _save(self.semantic_face_mask, "semantic_face_mask.png")
+        _save(self.original_alpha,     "original_alpha.png")
 
 
 # ============================================================================
@@ -902,6 +905,7 @@ def preprocess_image_in_memory(
 
     # 1. Background removal + auto-crop
     cropped_rgba, img_white_bg, crop_info = segment_and_crop(img)
+    original_alpha = cropped_rgba.getchannel("A")
     current_size = img_white_bg.size
 
     # 2. Split into two processing streams from the same white-BG source:
@@ -1002,4 +1006,5 @@ def preprocess_image_in_memory(
         original_size=current_size,
         crop_info=crop_info,
         semantic_face_mask=semantic_face_mask,
+        original_alpha=original_alpha,
     )

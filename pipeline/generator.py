@@ -386,112 +386,109 @@ def _load_ip_adapter(pipe, device: str, dtype: torch.dtype):
 
 
 # ============================================================================
-# SILHOUETTE MASK - fills interior holes left by rembg
-# ============================================================================
-
-def _fill_silhouette_mask(alpha: np.ndarray) -> np.ndarray:
-    """
-    Takes the raw alpha channel from rembg (uint8, 0-255) and returns a
-    cleaned mask where ALL pixels inside the outer silhouette boundary are
-    opaque - eliminating hollow interior regions (gaps between arm and torso,
-    gaps between legs, transparent dress/body areas, etc.).
-
-    Strategy:
-      1. Threshold alpha -> binary mask
-      2. Find all EXTERNAL contours only (cv2.RETR_EXTERNAL) - this ignores
-         any inner contour holes so we never see "inside" boundaries
-      3. Draw all external contours filled solid -> unified solid mask
-      4. Light morphological close to seal any tiny edge gaps
-      5. Gaussian blur edges for a natural anti-aliased blend
-    """
-    # Step 1: binary threshold
-    _, binary = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
-
-    # Step 2: find only external contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return alpha
-
-    # Step 3: draw all external contours filled - handles split legs, arms, etc.
-    solid_mask = np.zeros_like(alpha)
-    cv2.drawContours(solid_mask, contours, -1, 255, thickness=cv2.FILLED)
-
-    # Step 4: morphological close to seal tiny gaps at silhouette edges
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    solid_mask = cv2.morphologyEx(solid_mask, cv2.MORPH_CLOSE, kernel)
-
-    # Step 5: soft edge blur so the pasted sketch blends naturally into scene
-    solid_mask = cv2.GaussianBlur(solid_mask, (3, 3), 0)
-    # Re-threshold after blur to keep edges clean but not perfectly hard
-    _, solid_mask = cv2.threshold(solid_mask, 128, 255, cv2.THRESH_BINARY)
-
-    return solid_mask
-
-
-# ============================================================================
 # SCENE COMPOSITION
 # ============================================================================
 
-def _init_rembg():
-    global _REMBG_SESSION
-    if _REMBG_SESSION is None and REMBG_AVAILABLE:
-        try:
-            _REMBG_SESSION = new_session("u2net")
-        except Exception:
-            _REMBG_SESSION = new_session("u2netp")
 
-
-def _remove_sketch_background(img: Image.Image) -> Image.Image:
+def _compose_single_scene(
+    sketch_rgb: Image.Image,
+    original_alpha: Image.Image,
+    scene_path: Path,
+    scene_config: Dict,
+) -> Image.Image:
     """
-    Removes background via rembg then fills interior silhouette holes so the
-    sketch is a solid opaque cutout with no hollow regions inside the person.
+    Compose sketch_rgb onto a scene background using a Scale & Anchor strategy.
+
+    Args:
+        sketch_rgb:     The final post-processed sketch (RGB, white background).
+        original_alpha: The alpha channel extracted from cropped_rgba in the
+                        preprocessor (mode "L").  Used directly - no rembg re-run.
+        scene_path:     Path to the background scene image.
+        scene_config:   Dict with keys:
+                            "scale"  - float, fraction of the sketch's current size
+                            "anchor" - [x, y], floor pixel where bottom-centre
+                                       of the character should touch.
+
+    Returns:
+        RGB Image with the character composited onto the scene.
     """
-    if not REMBG_AVAILABLE:
-        return img.convert("RGBA")
+    from PIL import ImageDraw, ImageFilter
 
-    _init_rembg()
+    scale  = float(scene_config["scale"])
+    anchor = scene_config["anchor"]          # [x, y]
 
-    if img.mode != "RGBA":
-        img = img.convert("RGB")
+    # ------------------------------------------------------------------
+    # 1. Treat the mask: dilate to catch loose pencil strokes, then
+    #    feather the edge with a Gaussian blur.
+    # ------------------------------------------------------------------
+    alpha_arr = np.array(original_alpha, dtype=np.uint8)
+    kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    alpha_arr = cv2.dilate(alpha_arr, kernel, iterations=1)
+    alpha_arr = cv2.GaussianBlur(alpha_arr, (11, 11), 0)
+    treated_mask = Image.fromarray(alpha_arr, mode="L")
 
-    # Keep original RGB before rembg - rembg zeros out RGB under transparent
-    # pixels, so using its RGB would produce black interiors after mask fill.
-    original_rgb = img.convert("RGB")
+    # ------------------------------------------------------------------
+    # 2. Scale both the sketch and the treated mask uniformly.
+    # ------------------------------------------------------------------
+    orig_w, orig_h = sketch_rgb.size
+    resized_w = int(orig_w * scale)
+    resized_h = int(orig_h * scale)
 
-    # rembg background removal - gives RGBA; we only use its alpha channel
-    rgba = remove(img, session=_REMBG_SESSION)
+    resized_sketch = sketch_rgb.resize((resized_w, resized_h), Image.LANCZOS)
+    resized_mask   = treated_mask.resize((resized_w, resized_h), Image.LANCZOS)
 
-    # Extract raw alpha and fill any interior holes
-    alpha_raw = np.array(rgba.split()[3])
-    alpha_filled = _fill_silhouette_mask(alpha_raw)
+    # ------------------------------------------------------------------
+    # 3. Calculate floor-anchor paste position.
+    #    anchor = bottom-centre of the character in scene coordinates.
+    # ------------------------------------------------------------------
+    paste_x = int(anchor[0] - (resized_w / 2))
+    paste_y = int(anchor[1] - resized_h)
 
-    # Reconstruct RGBA: original RGB (full sketch detail) + filled alpha mask
-    result = original_rgb.convert("RGBA")
-    result.putalpha(Image.fromarray(alpha_filled))
+    # ------------------------------------------------------------------
+    # 4. Open scene; draw a soft drop shadow ellipse at the anchor point.
+    # ------------------------------------------------------------------
+    scene = Image.open(scene_path).convert("RGBA")
 
-    return result
+    shadow_layer = Image.new("RGBA", scene.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(shadow_layer)
+
+    ellipse_w = resized_w * 0.5
+    ellipse_h = resized_w * 0.12
+    cx, cy    = anchor[0], anchor[1]
+    shadow_box = [
+        cx - ellipse_w / 2,
+        cy - ellipse_h / 2,
+        cx + ellipse_w / 2,
+        cy + ellipse_h / 2,
+    ]
+    draw.ellipse(shadow_box, fill=(0, 0, 0, 255))
+
+    # Heavy blur to make the shadow soft and natural.
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=20))
+
+    # Reduce overall shadow opacity to ~40 %.
+    shadow_arr        = np.array(shadow_layer, dtype=np.float32)
+    shadow_arr[..., 3] = shadow_arr[..., 3] * 0.40
+    shadow_layer      = Image.fromarray(shadow_arr.astype(np.uint8), mode="RGBA")
+
+    scene = Image.alpha_composite(scene, shadow_layer)
+
+    # ------------------------------------------------------------------
+    # 5. Paste the resized sketch onto the scene using the treated mask.
+    # ------------------------------------------------------------------
+    scene.paste(resized_sketch, (paste_x, paste_y), resized_mask)
+
+    return scene.convert("RGB")
 
 
-def _compose_single_scene(sketch_rgba: Image.Image, scene_path: Path,
-                           bbox: List[int]) -> Image.Image:
-    scene = Image.open(scene_path).convert("RGB")
-    x1, y1, x2, y2 = bbox
-    target_w, target_h = x2 - x1, y2 - y1
-    sketch_w, sketch_h = sketch_rgba.size
-    ratio = max(target_w / sketch_w, target_h / sketch_h)
-    new_w, new_h = int(sketch_w * ratio), int(sketch_h * ratio)
-    resized = sketch_rgba.resize((new_w, new_h), Image.LANCZOS)
-    offset_x = x1 + (target_w - new_w) // 2
-    offset_y = y1 + (target_h - new_h) // 2
-    final_scene = scene.copy().convert("RGBA")
-    final_scene.paste(resized, (offset_x, offset_y), resized)
-    return final_scene.convert("RGB")
-
-
-def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Image]:
+def run_scene_composition_in_memory(
+    final_sketch: Image.Image,
+    data: PreprocessedData,
+) -> List[Image.Image]:
     """
-    Composes the sketch into all available scene backgrounds.
+    Composes the sketch into all available scene backgrounds using the
+    Scale & Anchor strategy.  Uses data.original_alpha directly - no rembg
+    re-run on the final sketch.
     Returns a list of PIL Images - no files saved.
     """
     if not SCENES_DIR.exists():
@@ -509,7 +506,8 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
         logger.warning("crops.json not found, skipping scene composition.")
         return []
 
-    sketch_transparent = _remove_sketch_background(final_sketch)
+    # crops.json is now a flat dict:
+    # { "scene_01": {"scale": 0.45, "anchor": [800, 1000]}, ... }
 
     scene_files: List[Path] = []
     for ext in ["*.png", "*.jpg", "*.jpeg"]:
@@ -520,7 +518,10 @@ def run_scene_composition_in_memory(final_sketch: Image.Image) -> List[Image.Ima
         if scene_id in crops_data:
             try:
                 return _compose_single_scene(
-                    sketch_transparent, scene_file, crops_data[scene_id][0]
+                    final_sketch,
+                    data.original_alpha,
+                    scene_file,
+                    crops_data[scene_id],
                 )
             except (OSError, ValueError):
                 logger.warning("Scene %s failed", scene_id, exc_info=True)
@@ -694,10 +695,7 @@ def generate_sketch_in_memory(
     )
 
     scene_images: List[Image.Image] = []
-    if REMBG_AVAILABLE:
-        scene_images = run_scene_composition_in_memory(final_sketch)
-    else:
-        logger.warning("rembg not available, skipping scene composition")
+    scene_images = run_scene_composition_in_memory(final_sketch, data)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
