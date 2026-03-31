@@ -46,12 +46,12 @@ The pipeline runs completely offline. You must download the required model weigh
 
 **BiSeNet (Required for FRU Face Parsing):**
 
-- Download `bisenet_face_parsing.pth` from Google Drive Link.
+- Download `bisenet_face_parsing.pth` from Google Drive Link (https://drive.google.com/file/d/154JgKpzCPW82qINcVieuPH3fZ2e0P812/view).
 - Place it in: `models/bisenet/bisenet_face_parsing.pth`
 
 **TAESD (Required for fast LCM decoding):**
 
-- Go to the TAESD HuggingFace Repo.
+- Go to the TAESD HuggingFace Repo (https://huggingface.co/madebyollin/taesd/tree/main).
 - Download `config.json` and `diffusion_pytorch_model.safetensors`.
 - Place both files in: `models/taesd/`
 
