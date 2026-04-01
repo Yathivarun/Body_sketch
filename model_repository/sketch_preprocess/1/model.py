@@ -113,4 +113,25 @@ class TritonPythonModel:
         return self._make_response(pb_utils, pickle.dumps(None), person_id, status)
 
     def finalize(self):
-        print("[sketch_preprocess] Finalised")
+        import torch
+
+        # Clear the shared pipeline model cache if it was populated
+        try:
+            from pipeline import preprocessor as _pre_mod
+            if hasattr(_pre_mod, "_MODEL_CACHE"):
+                _pre_mod._MODEL_CACHE.clear()
+                print("[sketch_preprocess] _MODEL_CACHE cleared (SAU preprocessor)")
+        except Exception:
+            pass
+
+        try:
+            from pipeline import fru_preprocessor as _fru_mod
+            if hasattr(_fru_mod, "_MODEL_CACHE"):
+                _fru_mod._MODEL_CACHE.clear()
+                print("[sketch_preprocess] _MODEL_CACHE cleared (FRU preprocessor)")
+        except Exception:
+            pass
+
+        # Release any VRAM that PyTorch allocated for preprocessing ops
+        torch.cuda.empty_cache()
+        print("[sketch_preprocess] Finalised — VRAM released")

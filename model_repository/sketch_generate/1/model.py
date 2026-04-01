@@ -143,4 +143,25 @@ class TritonPythonModel:
         return self._make_response(pb_utils, [b""], [b""], person_id, status)
 
     def finalize(self):
-        print("[sketch_generate] Finalised")
+        import torch
+
+        # Clear the shared pipeline model cache if it was populated
+        try:
+            from pipeline import generator as _gen_mod
+            if hasattr(_gen_mod, "_MODEL_CACHE"):
+                _gen_mod._MODEL_CACHE.clear()
+                print("[sketch_generate] _MODEL_CACHE cleared (SAU generator)")
+        except Exception:
+            pass
+
+        try:
+            from pipeline import fru_generator as _fru_mod
+            if hasattr(_fru_mod, "_MODEL_CACHE"):
+                _fru_mod._MODEL_CACHE.clear()
+                print("[sketch_generate] _MODEL_CACHE cleared (FRU generator)")
+        except Exception:
+            pass
+
+        # Release any remaining VRAM allocations
+        torch.cuda.empty_cache()
+        print("[sketch_generate] Finalised — VRAM released")

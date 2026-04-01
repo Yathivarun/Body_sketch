@@ -15,4 +15,4 @@ output [
   { name: "status"        data_type: TYPE_STRING  dims: [ 1 ] }
 ]
 
-instance_group [{ kind: KIND_GPU  gpus: [ 0 ]  count: 1 }]
+instance_group [{ kind: KIND_GPU  gpus: [ 0 ]  count: 3 }]

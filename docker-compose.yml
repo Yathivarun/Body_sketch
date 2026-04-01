@@ -33,12 +33,18 @@ services:
       - ./crops.json:/app/crops.json:ro
       - ./crops-face-meta.json:/app/crops-face-meta.json:ro
 
+      # Hot-reload: pipeline logic and Triton model repository
+      - ./pipeline:/app/pipeline:ro
+      - ./model_repository:/app/model_repository:ro
+
     # ── Environment ───────────────────────────────────────────────────────────
     environment:
       - PYTHONPATH=/app
       # Prevent rembg / huggingface from downloading at runtime
       - TRANSFORMERS_OFFLINE=1
       - HF_DATASETS_OFFLINE=1
+      # Tell rembg to load U2Net weights from the locally mounted models dir
+      - U2NET_HOME=/app/models/u2net
 
     # ── Shared memory for Triton tensor transfers ─────────────────────────────
     shm_size: "4gb"
